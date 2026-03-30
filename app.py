@@ -23,6 +23,7 @@ import db
 import strava
 import metrics as metrics_mod
 import coaching as coach_mod
+import reconciliation as recon_mod
 from poller import Poller
 
 # ---------------------------------------------------------------------------
@@ -718,6 +719,61 @@ def dashboard():
 </div>
 """
 
+    # Today's Training Decision card
+    ride_style = coaching.get("ride_style", "")
+    ride_rationale = coaching.get("ride_style_rationale", "")
+    suggested_dur = coaching.get("suggested_duration_minutes", 0)
+    suggested_tss = coaching.get("suggested_tss", 0)
+
+    training_decision_card = ""
+    if ride_style and has_strava:
+        style_icon = recon_mod.STYLE_ICONS.get(ride_style, "🚴")
+        dur_str = f"{suggested_dur} min" if suggested_dur else ""
+        tss_str = f"~{suggested_tss} TSS" if suggested_tss else ""
+        details_str = " · ".join(filter(None, [dur_str, tss_str]))
+        training_decision_card = f"""
+<div class="bg-gray-900 rounded-xl p-4 mb-3">
+  <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Today's Training Decision</p>
+  <div class="flex items-start justify-between mb-2">
+    <div>
+      <p class="text-base font-bold text-gray-100">{style_icon} {ride_style}</p>
+      {f'<p class="text-xs text-gray-500 mt-0.5">{details_str}</p>' if details_str else ''}
+    </div>
+    <a href="{url_for('coaching')}" class="text-xs text-cyan-500 hover:text-cyan-300 mt-0.5">Detail →</a>
+  </div>
+  {f'<p class="text-sm text-gray-400 leading-relaxed">{ride_rationale}</p>' if ride_rationale else ''}
+</div>
+"""
+
+    # Yesterday vs Plan card
+    recon_state = coaching.get("recon_state")
+    yesterday_card = ""
+    if recon_state and has_strava:
+        label, color, icon = recon_mod.RECON_LABELS.get(
+            recon_state, (recon_state, "text-gray-400", "?"))
+        recon_planned_title = coaching.get("recon_planned_title", "")
+        recon_actual_name = coaching.get("recon_actual_name", "")
+        recon_planned_tss = coaching.get("recon_planned_tss", 0)
+        recon_actual_tss = coaching.get("recon_actual_tss", 0)
+
+        tss_line = ""
+        if recon_state not in (recon_mod.UNPLANNED_RIDE, recon_mod.PLAN_SKIPPED):
+            tss_line = f'<p class="text-xs text-gray-500 mt-1">{recon_actual_tss:.0f} TSS actual · {recon_planned_tss:.0f} TSS planned</p>'
+        elif recon_state == recon_mod.UNPLANNED_RIDE and recon_actual_tss:
+            tss_line = f'<p class="text-xs text-gray-500 mt-1">{recon_actual_tss:.0f} TSS</p>'
+
+        name_line = recon_actual_name or recon_planned_title
+        yesterday_card = f"""
+<div class="bg-gray-900 rounded-xl p-4 mb-3">
+  <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Yesterday vs Plan</p>
+  <div class="flex items-center gap-2">
+    <span class="{color} text-sm font-semibold">{icon} {label}</span>
+    {f'<span class="text-xs text-gray-500">· {name_line}</span>' if name_line else ''}
+  </div>
+  {tss_line}
+</div>
+"""
+
     # Strava connect prompt
     strava_prompt = ""
     if not has_strava:
@@ -735,7 +791,8 @@ def dashboard():
     if mc and mc["updated_at"]:
         updated_at = f'<p class="text-xs text-gray-600 text-center mt-2">Updated {mc["updated_at"]} UTC</p>'
 
-    body = (strava_prompt + readiness_card + workout_card + metrics_card +
+    body = (strava_prompt + readiness_card + training_decision_card +
+            workout_card + yesterday_card + metrics_card +
             profile_card + last_ride_card + week_card + month_card + updated_at)
 
     html = (
@@ -945,7 +1002,58 @@ def coaching():
 </div>
 """
 
-    body = (status_section + metrics_grid + workout_section + goal_section +
+    # Ride style suggestion
+    ride_style = coaching_data.get("ride_style", "")
+    ride_rationale = coaching_data.get("ride_style_rationale", "")
+    suggested_dur = coaching_data.get("suggested_duration_minutes", 0)
+    suggested_tss = coaching_data.get("suggested_tss", 0)
+    recon_state = coaching_data.get("recon_state")
+
+    ride_style_section = ""
+    if ride_style:
+        style_icon = recon_mod.STYLE_ICONS.get(ride_style, "🚴")
+        dur_str = f"{suggested_dur} min" if suggested_dur else ""
+        tss_str = f"~{suggested_tss} TSS" if suggested_tss else ""
+        details_str = " · ".join(filter(None, [dur_str, tss_str]))
+        ride_style_section = f"""
+<div class="bg-gray-900 rounded-xl p-4 mb-3">
+  <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3">Today's Ride Suggestion</p>
+  <div class="flex items-center justify-between mb-2">
+    <p class="text-base font-bold text-gray-100">{style_icon} {ride_style}</p>
+    {f'<p class="text-xs text-gray-500">{details_str}</p>' if details_str else ''}
+  </div>
+  {f'<p class="text-sm text-gray-400 leading-relaxed">{ride_rationale}</p>' if ride_rationale else ''}
+</div>
+"""
+
+    # Yesterday vs Plan
+    yesterday_recon_section = ""
+    if recon_state:
+        label, color, icon = recon_mod.RECON_LABELS.get(
+            recon_state, (recon_state, "text-gray-400", "?"))
+        rpt = coaching_data.get("recon_planned_title", "")
+        ran = coaching_data.get("recon_actual_name", "")
+        rpt_tss = coaching_data.get("recon_planned_tss", 0)
+        rat_tss = coaching_data.get("recon_actual_tss", 0)
+        tss_line = ""
+        if recon_state not in (recon_mod.UNPLANNED_RIDE, recon_mod.PLAN_SKIPPED) and rpt_tss:
+            tss_line = f'<p class="text-xs text-gray-500 mt-1">{rat_tss:.0f} TSS actual vs {rpt_tss:.0f} TSS planned</p>'
+        elif recon_state == recon_mod.UNPLANNED_RIDE and rat_tss:
+            tss_line = f'<p class="text-xs text-gray-500 mt-1">{rat_tss:.0f} TSS</p>'
+        name_line = ran or rpt
+        yesterday_recon_section = f"""
+<div class="bg-gray-900 rounded-xl p-4 mb-3">
+  <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Yesterday vs Plan</p>
+  <div class="flex items-center gap-2">
+    <span class="{color} text-sm font-semibold">{icon} {label}</span>
+    {f'<span class="text-xs text-gray-500">· {name_line}</span>' if name_line else ''}
+  </div>
+  {tss_line}
+</div>
+"""
+
+    body = (status_section + ride_style_section + metrics_grid +
+            yesterday_recon_section + workout_section + goal_section +
             risk_section + flags_section + insights_section)
 
     html = (

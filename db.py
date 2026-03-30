@@ -134,6 +134,21 @@ def init_db(db_path: str) -> None:
                 target_hr_high      INTEGER DEFAULT 0,
                 created_at          TEXT    NOT NULL DEFAULT (datetime('now'))
             );
+
+            CREATE TABLE IF NOT EXISTS activity_log (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id         INTEGER NOT NULL REFERENCES users(id),
+                strava_id       INTEGER,
+                date            TEXT    NOT NULL,
+                name            TEXT    DEFAULT '',
+                moving_time_s   REAL    DEFAULT 0,
+                distance_m      REAL    DEFAULT 0,
+                tss             REAL    DEFAULT 0,
+                avg_watts       REAL    DEFAULT 0,
+                elevation_m     REAL    DEFAULT 0,
+                created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(user_id, strava_id)
+            );
         """)
         _run_migrations(conn)
         _seed_ftp_history(conn)
@@ -146,12 +161,27 @@ def _run_migrations(conn) -> None:
         "ALTER TABLE metrics_cache ADD COLUMN weekly_tss REAL DEFAULT 0",
         "ALTER TABLE metrics_cache ADD COLUMN weekly_longest_distance_m REAL DEFAULT 0",
         "ALTER TABLE metrics_cache ADD COLUMN prev_ctl REAL DEFAULT 0",
+        # activity_log table added in schema; migration guard for existing DBs
+        """CREATE TABLE IF NOT EXISTS activity_log (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id         INTEGER NOT NULL REFERENCES users(id),
+            strava_id       INTEGER,
+            date            TEXT    NOT NULL,
+            name            TEXT    DEFAULT '',
+            moving_time_s   REAL    DEFAULT 0,
+            distance_m      REAL    DEFAULT 0,
+            tss             REAL    DEFAULT 0,
+            avg_watts       REAL    DEFAULT 0,
+            elevation_m     REAL    DEFAULT 0,
+            created_at      TEXT    NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(user_id, strava_id)
+        )""",
     ]
     for sql in migrations:
         try:
             conn.execute(sql)
         except Exception:
-            pass  # column already exists
+            pass  # column/table already exists
 
 
 def _seed_ftp_history(conn) -> None:
@@ -697,3 +727,83 @@ def get_coaching_cache(db_path: str, user_id: int):
         except Exception:
             return {}
     return {}
+
+
+# ---------------------------------------------------------------------------
+# Activity log (last 30 days of rides for reconciliation)
+# ---------------------------------------------------------------------------
+
+def log_activities(db_path: str, user_id: int, activities: list, ftp: float) -> None:
+    """
+    Upsert recent cycling activities into activity_log.
+    Only stores rides from the last 30 days. Older rows are pruned.
+    activities: raw Strava activity dicts (already filtered to cycling types in metrics).
+    """
+    from datetime import date, timedelta
+    from metrics import estimate_tss, _parse_start_ts, CYCLING_TYPES
+
+    cutoff = (date.today() - timedelta(days=30)).isoformat()
+    conn = get_conn(db_path)
+    with conn:
+        # Prune old entries
+        conn.execute(
+            "DELETE FROM activity_log WHERE user_id = ? AND date < ?",
+            (user_id, cutoff)
+        )
+        for act in activities:
+            if act.get("type") not in CYCLING_TYPES and act.get("sport_type") not in CYCLING_TYPES:
+                continue
+            ts = _parse_start_ts(act)
+            if ts <= 0:
+                continue
+            from datetime import datetime, timezone
+            act_date = datetime.fromtimestamp(ts, tz=timezone.utc).date().isoformat()
+            if act_date < cutoff:
+                continue
+            strava_id = act.get("id")
+            conn.execute(
+                """INSERT INTO activity_log
+                   (user_id, strava_id, date, name, moving_time_s, distance_m, tss, avg_watts, elevation_m)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(user_id, strava_id) DO UPDATE SET
+                     date=excluded.date, name=excluded.name,
+                     moving_time_s=excluded.moving_time_s,
+                     distance_m=excluded.distance_m,
+                     tss=excluded.tss,
+                     avg_watts=excluded.avg_watts,
+                     elevation_m=excluded.elevation_m""",
+                (
+                    user_id, strava_id, act_date,
+                    act.get("name", ""),
+                    float(act.get("moving_time") or 0),
+                    float(act.get("distance") or 0),
+                    estimate_tss(act, ftp),
+                    float(act.get("average_watts") or 0),
+                    float(act.get("total_elevation_gain") or 0),
+                )
+            )
+    conn.close()
+
+
+def get_activities_for_date(db_path: str, user_id: int, date_str: str) -> list:
+    """Return all logged rides for a specific date."""
+    conn = get_conn(db_path)
+    rows = conn.execute(
+        "SELECT * FROM activity_log WHERE user_id = ? AND date = ? ORDER BY id ASC",
+        (user_id, date_str)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_recent_activities(db_path: str, user_id: int, days: int = 14) -> list:
+    """Return rides from the last N days, newest first."""
+    from datetime import date, timedelta
+    cutoff = (date.today() - timedelta(days=days)).isoformat()
+    conn = get_conn(db_path)
+    rows = conn.execute(
+        "SELECT * FROM activity_log WHERE user_id = ? AND date >= ? ORDER BY date DESC",
+        (user_id, cutoff)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
