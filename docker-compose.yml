@@ -1,0 +1,16 @@
+services:
+  cycling-club:
+    build: .
+    container_name: cycling-club
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "9206:9206"
+    volumes:
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9206/health')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 15s
+      retries: 3
