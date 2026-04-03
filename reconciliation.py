@@ -1,56 +1,94 @@
 """
 reconciliation.py - Plan vs actual ride comparison and ride style suggestion.
-Deterministic, no AI. All logic is rule-based from TSB + training profile + plan.
+Deterministic, no AI. Logic driven by TSB band + recent ride pattern + training goal.
+Outdoor-friendly ride styles, not structured intervals.
 """
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, List
-from datetime import date as _date
+from datetime import date as _date, timedelta as _td
 
 # ---------------------------------------------------------------------------
 # Reconciliation states
 # ---------------------------------------------------------------------------
-PLAN_COMPLETED     = "PLAN_COMPLETED"
-PLAN_OVERPERFORMED = "PLAN_OVERPERFORMED"
+PLAN_COMPLETED      = "PLAN_COMPLETED"
+PLAN_OVERPERFORMED  = "PLAN_OVERPERFORMED"
 PLAN_UNDERPERFORMED = "PLAN_UNDERPERFORMED"
-PLAN_SKIPPED       = "PLAN_SKIPPED"
-UNPLANNED_RIDE     = "UNPLANNED_RIDE"
+PLAN_SKIPPED        = "PLAN_SKIPPED"
+UNPLANNED_RIDE      = "UNPLANNED_RIDE"
 
-# Human-readable labels and colours per state
 RECON_LABELS = {
-    PLAN_COMPLETED:     ("Completed",      "text-green-400",  "✓"),
-    PLAN_OVERPERFORMED: ("Overperformed",  "text-cyan-400",   "↑"),
-    PLAN_UNDERPERFORMED:("Underperformed", "text-yellow-400", "↓"),
-    PLAN_SKIPPED:       ("Skipped",        "text-gray-500",   "–"),
-    UNPLANNED_RIDE:     ("Unplanned ride", "text-blue-400",   "~"),
+    PLAN_COMPLETED:      ("Completed",      "text-green-400",  "✓"),
+    PLAN_OVERPERFORMED:  ("Overperformed",  "text-cyan-400",   "↑"),
+    PLAN_UNDERPERFORMED: ("Underperformed", "text-yellow-400", "↓"),
+    PLAN_SKIPPED:        ("Skipped",        "text-gray-500",   "–"),
+    UNPLANNED_RIDE:      ("Unplanned ride", "text-blue-400",   "~"),
 }
 
 # ---------------------------------------------------------------------------
-# Ride styles
+# Ride styles — outdoor formats only, no structured intervals
 # ---------------------------------------------------------------------------
-ENDURANCE_RIDE = "Endurance Ride"
-HILL_EFFORTS   = "Hill Efforts"
-TEMPO_TERRAIN  = "Tempo Terrain Ride"
-RECOVERY_SPIN  = "Recovery Spin"
-REST_DAY       = "Rest Day"
+EASY_SPIN          = "Easy Spin"
+ENDURANCE_RIDE     = "Endurance Ride"
+ROLLING_ENDURANCE  = "Rolling Endurance Ride"
+LONG_ENDURANCE     = "Long Endurance Ride"
+HILL_EFFORTS       = "Hill Efforts"
+TEMPO_TERRAIN      = "Tempo Terrain Ride"
+REST_DAY           = "Rest Day"
+
+# Backward-compat alias (old coaching_cache entries may use this)
+RECOVERY_SPIN = "Recovery Spin"
 
 # Default duration (min) and TSS per style
 _STYLE_DEFAULTS = {
-    ENDURANCE_RIDE: {"duration_min": 90,  "tss": 65},
-    HILL_EFFORTS:   {"duration_min": 90,  "tss": 85},
-    TEMPO_TERRAIN:  {"duration_min": 80,  "tss": 90},
-    RECOVERY_SPIN:  {"duration_min": 50,  "tss": 25},
-    REST_DAY:       {"duration_min": 0,   "tss": 0},
+    EASY_SPIN:         {"duration_min": 50,  "tss": 20},
+    RECOVERY_SPIN:     {"duration_min": 50,  "tss": 25},
+    ENDURANCE_RIDE:    {"duration_min": 90,  "tss": 65},
+    ROLLING_ENDURANCE: {"duration_min": 100, "tss": 75},
+    LONG_ENDURANCE:    {"duration_min": 150, "tss": 100},
+    HILL_EFFORTS:      {"duration_min": 90,  "tss": 85},
+    TEMPO_TERRAIN:     {"duration_min": 80,  "tss": 90},
+    REST_DAY:          {"duration_min": 0,   "tss": 0},
 }
 
-# Ride style icons for UI
+# Icons for UI display
 STYLE_ICONS = {
-    ENDURANCE_RIDE: "🚴",
-    HILL_EFFORTS:   "⛰",
-    TEMPO_TERRAIN:  "⚡",
-    RECOVERY_SPIN:  "💚",
-    REST_DAY:       "😴",
+    EASY_SPIN:         "💨",
+    RECOVERY_SPIN:     "💨",
+    ENDURANCE_RIDE:    "🚴",
+    ROLLING_ENDURANCE: "🌄",
+    LONG_ENDURANCE:    "🛣️",
+    HILL_EFFORTS:      "⛰️",
+    TEMPO_TERRAIN:     "⚡",
+    REST_DAY:          "😴",
 }
+
+# Terrain-driven ride hints — how to ride it, not interval prescriptions
+STYLE_HINTS = {
+    EASY_SPIN:
+        "Spin easy on familiar roads. Keep the effort fully conversational throughout.",
+    RECOVERY_SPIN:
+        "Keep effort minimal — if you're breathing hard, you're going too fast.",
+    ENDURANCE_RIDE:
+        "Steady effort at a pace you could hold all day. No need to push.",
+    ROLLING_ENDURANCE:
+        "Pick a route with some gentle hills and let the terrain vary the effort naturally.",
+    LONG_ENDURANCE:
+        "Get out for a longer ride at a steady, sustainable pace. Take food and enjoy it.",
+    HILL_EFFORTS:
+        "Find 4–6 climbs lasting 3–6 minutes and ride them with purpose. Easy between each.",
+    TEMPO_TERRAIN:
+        "Pick a rolling or undulating route and ride at a sustained, comfortably hard effort.",
+    REST_DAY:
+        "Off the bike today. Stretch, walk, or simply rest.",
+}
+
+# ---------------------------------------------------------------------------
+# Thresholds used in pattern analysis
+# ---------------------------------------------------------------------------
+_HARD_TSS = 70         # rides above this count as a "hard effort"
+_BIG_RIDE_TSS = 100    # yesterday at this TSS or above → favour easy today
+_LONG_RIDE_S = 5400    # 90 min: threshold for "had a long ride this week"
 
 
 # ---------------------------------------------------------------------------
@@ -59,7 +97,7 @@ STYLE_ICONS = {
 
 @dataclass
 class ReconciliationResult:
-    state: Optional[str]             # one of the state constants above, or None
+    state: Optional[str] = None
     planned_tss: float = 0.0
     actual_tss: float = 0.0
     planned_duration_minutes: int = 0
@@ -111,7 +149,6 @@ def evaluate_plan_reconciliation(
     elif has_plan and not has_ride:
         state = PLAN_SKIPPED
     else:
-        # Both plan and ride — compare TSS if target was set
         if planned_tss > 0:
             ratio = actual_tss / planned_tss
             if ratio >= 1.2:
@@ -121,7 +158,6 @@ def evaluate_plan_reconciliation(
             else:
                 state = PLAN_UNDERPERFORMED
         else:
-            # No TSS target: presence of any ride = completed
             state = PLAN_COMPLETED
 
     return ReconciliationResult(
@@ -136,6 +172,66 @@ def evaluate_plan_reconciliation(
 
 
 # ---------------------------------------------------------------------------
+# Recent pattern analysis
+# ---------------------------------------------------------------------------
+
+def _analyse_pattern(recent_rides: list) -> dict:
+    """
+    Derive lightweight training pattern signals from recent activity_log entries.
+    recent_rides: list of dicts (from db.get_recent_activities), any order.
+    """
+    today = _date.today()
+    week_start = today - _td(days=today.weekday())
+    yesterday = (today - _td(days=1)).isoformat()
+
+    # Sort newest first
+    rides = sorted(recent_rides, key=lambda r: r.get("date", ""), reverse=True)
+
+    # Yesterday's total TSS
+    yesterday_tss = sum(
+        float(r.get("tss") or 0) for r in rides if r.get("date") == yesterday
+    )
+
+    # Hard effort frequency in the last 5 rides
+    last_5 = rides[:5]
+    hard_count_last5 = sum(1 for r in last_5 if float(r.get("tss") or 0) >= _HARD_TSS)
+
+    # Days since most recent hard effort
+    days_since_hard: Optional[int] = None
+    for r in rides:
+        if float(r.get("tss") or 0) >= _HARD_TSS:
+            try:
+                ride_date = _date.fromisoformat(r["date"])
+                days_since_hard = (today - ride_date).days
+            except (ValueError, KeyError):
+                pass
+            break
+
+    # Long ride this week (≥90 min moving time)
+    had_long_ride_this_week = any(
+        float(r.get("moving_time_s") or 0) >= _LONG_RIDE_S
+        for r in rides
+        if r.get("date", "") >= week_start.isoformat()
+    )
+
+    # Days since last ride of any kind
+    days_since_last: Optional[int] = None
+    if rides:
+        try:
+            days_since_last = (today - _date.fromisoformat(rides[0]["date"])).days
+        except (ValueError, KeyError):
+            pass
+
+    return {
+        "yesterday_tss":          yesterday_tss,
+        "hard_count_last5":       hard_count_last5,
+        "days_since_hard":        days_since_hard,
+        "had_long_ride_this_week": had_long_ride_this_week,
+        "days_since_last_ride":   days_since_last,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Ride style suggestion
 # ---------------------------------------------------------------------------
 
@@ -147,11 +243,13 @@ def suggest_ride(
     training_profile: Optional[dict] = None,
     yesterday_recon: Optional[ReconciliationResult] = None,
     today_plan: Optional[dict] = None,
+    recent_rides: Optional[list] = None,
 ) -> dict:
     """
     Return a ride style suggestion dict for merging into coaching_cache.
 
-    Keys: ride_style, suggested_duration_minutes, suggested_tss, ride_style_rationale
+    Keys: ride_style, suggested_duration_minutes, suggested_tss,
+          ride_style_rationale, ride_hint
     """
     p = training_profile or {}
     goal = p.get("goal", "")
@@ -160,43 +258,79 @@ def suggest_ride(
     weekly_hours_target = float(p.get("weekly_hours_target") or 0)
     target_event_date = p.get("target_event_date", "")
 
+    pattern = _analyse_pattern(recent_rides or [])
+
+    # -----------------------------------------------------------------
     # 1. Base style from TSB classification
+    # -----------------------------------------------------------------
     style = _base_style(classification)
 
-    # 2. Apply goal modifier (only when not already rest/recovery)
-    if style not in (REST_DAY, RECOVERY_SPIN):
+    # -----------------------------------------------------------------
+    # 2. Pattern overrides — applied before goal modifier
+    #    These take priority because they reflect concrete recent data.
+    # -----------------------------------------------------------------
+
+    # CASE 1: Heavy riding recently + big effort yesterday → easy day
+    if (classification in ("Productive Fatigue", "Heavy Load", "Very Fatigued")
+            and pattern["yesterday_tss"] >= _BIG_RIDE_TSS):
+        style = EASY_SPIN
+
+    # CASE 2: Moderate fatigue but no hard effort recently
+    #         → a few controlled hill efforts is appropriate stimulus
+    elif (classification in ("Productive Fatigue", "Slight Fatigue")
+          and pattern["hard_count_last5"] == 0
+          and (pattern["days_since_hard"] is None or pattern["days_since_hard"] >= 5)):
+        style = HILL_EFFORTS
+
+    # CASE 3: Fresh/Ready + no long ride this week → priority for long endurance
+    elif (classification in ("Fresh", "Ready")
+          and not pattern["had_long_ride_this_week"]):
+        style = LONG_ENDURANCE
+
+    # -----------------------------------------------------------------
+    # 3. Goal modifier (only when not already on an easy/rest day)
+    # -----------------------------------------------------------------
+    if style not in (REST_DAY, RECOVERY_SPIN, EASY_SPIN):
         style = _apply_goal(style, classification, effective_goal, target_event_date)
 
-    # 3. Downgrade if weekly volume is already well above target
+    # -----------------------------------------------------------------
+    # 4. Downgrade if weekly volume is well above target
+    # -----------------------------------------------------------------
     if weekly_hours_target > 0 and weekly_hours > weekly_hours_target * 1.25:
         style = _downgrade(style)
 
-    # 4. If today has a planned workout, honour it when readiness allows
-    if today_plan and style not in (REST_DAY, RECOVERY_SPIN):
+    # -----------------------------------------------------------------
+    # 5. Honour today's planned workout when readiness allows
+    # -----------------------------------------------------------------
+    if today_plan and style not in (REST_DAY, RECOVERY_SPIN, EASY_SPIN):
         plan_style = _plan_type_to_style(today_plan.get("type", ""))
         if plan_style and _safe_for_readiness(plan_style, classification):
             style = plan_style
 
-    # 5. Derive duration and TSS
-    defaults = _STYLE_DEFAULTS[style]
+    # -----------------------------------------------------------------
+    # 6. Duration and TSS
+    # -----------------------------------------------------------------
+    defaults = _STYLE_DEFAULTS.get(style, _STYLE_DEFAULTS[ENDURANCE_RIDE])
     duration_min = defaults["duration_min"]
     tss = defaults["tss"]
 
-    # Scale down if weekly target is modest and session would be too long
-    if weekly_hours_target > 0 and style not in (REST_DAY, RECOVERY_SPIN):
+    # Scale down if weekly target is modest
+    if weekly_hours_target > 0 and style not in (REST_DAY, RECOVERY_SPIN, EASY_SPIN):
         max_min = int((weekly_hours_target / 4.0) * 60)
         if 30 <= max_min < duration_min:
             tss = int(tss * max_min / duration_min)
             duration_min = max_min
 
     rationale = _rationale(style, classification, effective_goal,
-                           yesterday_recon, today_plan)
+                            pattern, yesterday_recon, today_plan)
+    hint = STYLE_HINTS.get(style, "")
 
     return {
         "ride_style":                style,
         "suggested_duration_minutes": duration_min,
         "suggested_tss":             tss,
         "ride_style_rationale":      rationale,
+        "ride_hint":                 hint,
     }
 
 
@@ -207,11 +341,11 @@ def suggest_ride(
 def _base_style(classification: str) -> str:
     return {
         "Fresh":              HILL_EFFORTS,
-        "Ready":              TEMPO_TERRAIN,
+        "Ready":              ROLLING_ENDURANCE,
         "Slight Fatigue":     ENDURANCE_RIDE,
         "Productive Fatigue": ENDURANCE_RIDE,
-        "Heavy Load":         RECOVERY_SPIN,
-        "Very Fatigued":      RECOVERY_SPIN,
+        "Heavy Load":         EASY_SPIN,
+        "Very Fatigued":      EASY_SPIN,
         "Deep Fatigue":       REST_DAY,
     }.get(classification, ENDURANCE_RIDE)
 
@@ -219,19 +353,20 @@ def _base_style(classification: str) -> str:
 def _apply_goal(style: str, classification: str,
                 goal: str, target_event_date: str) -> str:
     if goal == "Build aerobic base":
-        return ENDURANCE_RIDE
+        # Always favour endurance for base building, but long endurance stays
+        return style if style == LONG_ENDURANCE else ENDURANCE_RIDE
 
     if goal == "Raise FTP / threshold":
         if classification in ("Fresh", "Ready"):
             return TEMPO_TERRAIN
         if classification in ("Slight Fatigue", "Productive Fatigue"):
-            return ENDURANCE_RIDE
+            return ENDURANCE_RIDE  # absorb load first
 
     if goal == "Prepare for an event" and target_event_date:
         try:
             days_left = (_date.fromisoformat(target_event_date) - _date.today()).days
             if 0 <= days_left <= 3:
-                return RECOVERY_SPIN
+                return EASY_SPIN
             if days_left <= 7:
                 return ENDURANCE_RIDE
         except ValueError:
@@ -239,13 +374,14 @@ def _apply_goal(style: str, classification: str,
 
     if goal == "Improve endurance for longer rides":
         if classification in ("Fresh", "Ready", "Slight Fatigue"):
-            return ENDURANCE_RIDE
+            return style if style == LONG_ENDURANCE else ENDURANCE_RIDE
 
     return style
 
 
 def _downgrade(style: str) -> str:
-    chain = [HILL_EFFORTS, TEMPO_TERRAIN, ENDURANCE_RIDE, RECOVERY_SPIN]
+    chain = [HILL_EFFORTS, TEMPO_TERRAIN, LONG_ENDURANCE,
+             ROLLING_ENDURANCE, ENDURANCE_RIDE, EASY_SPIN]
     idx = chain.index(style) if style in chain else -1
     if 0 <= idx < len(chain) - 1:
         return chain[idx + 1]
@@ -258,13 +394,12 @@ def _plan_type_to_style(plan_type: str) -> Optional[str]:
         "tempo":     TEMPO_TERRAIN,
         "threshold": TEMPO_TERRAIN,
         "vo2":       HILL_EFFORTS,
-        "recovery":  RECOVERY_SPIN,
+        "recovery":  EASY_SPIN,
         "rest":      REST_DAY,
     }.get(plan_type)
 
 
 def _safe_for_readiness(style: str, classification: str) -> bool:
-    """Return True if readiness level is adequate for the given style."""
     if style in (HILL_EFFORTS, TEMPO_TERRAIN):
         return classification in ("Fresh", "Ready", "Slight Fatigue", "Productive Fatigue")
     return True
@@ -274,51 +409,82 @@ def _rationale(
     style: str,
     classification: str,
     goal: str,
+    pattern: dict,
     yesterday_recon: Optional[ReconciliationResult],
     today_plan: Optional[dict],
 ) -> str:
     parts = []
 
-    # Lead with TSB state
-    state_text = {
-        "Fresh":              "You're well rested",
-        "Ready":              "You're ready to train",
-        "Slight Fatigue":     "You're carrying slight fatigue",
-        "Productive Fatigue": "You're in a productive loading phase",
-        "Heavy Load":         "Your load is high",
-        "Very Fatigued":      "You're quite fatigued",
-        "Deep Fatigue":       "You're deeply fatigued",
-    }.get(classification, "Based on your current load")
+    yesterday_tss = pattern.get("yesterday_tss", 0)
+    days_since_hard = pattern.get("days_since_hard")
+    had_long_ride = pattern.get("had_long_ride_this_week", False)
 
-    style_text = {
-        HILL_EFFORTS:   "— a good window for hill efforts",
-        TEMPO_TERRAIN:  "— well placed for a tempo terrain ride",
-        ENDURANCE_RIDE: "— steady endurance is the right call",
-        RECOVERY_SPIN:  "— keep it easy today",
-        REST_DAY:       "— rest is strongly recommended",
-    }.get(style, "")
+    # --- Lead sentence: what the body is doing right now ---
+    if style == EASY_SPIN and yesterday_tss >= _BIG_RIDE_TSS:
+        parts.append(
+            "Legs are carrying some load from recent riding. "
+            "An easy spin today will help absorb the work — "
+            "but if you feel good out there, a relaxed endurance ride is fine too."
+        )
+    elif style == EASY_SPIN:
+        parts.append(
+            "Fatigue is elevated right now. "
+            "Keeping today easy will let the training bed in properly."
+        )
+    elif style == REST_DAY:
+        parts.append(
+            "Body is asking for a rest today. "
+            "Taking it easy will set you up better for the next session."
+        )
+    elif style == HILL_EFFORTS and classification in ("Productive Fatigue", "Slight Fatigue"):
+        parts.append(
+            "You're carrying some training load, but it's been a while since your last harder effort. "
+            "A few controlled hill efforts could work well today — keep them steady, not all-out."
+        )
+    elif style == HILL_EFFORTS:
+        parts.append("You're well rested — a good window for some quality hill efforts.")
+    elif style == LONG_ENDURANCE and not had_long_ride:
+        parts.append(
+            "You're fresh and there hasn't been a longer ride this week. "
+            "Good conditions to get out for an extended endurance ride."
+        )
+    elif style == TEMPO_TERRAIN:
+        parts.append(
+            "You're well rested — a good window for some quality riding. "
+            "Find terrain that lets you push at a sustained effort."
+        )
+    elif style == ROLLING_ENDURANCE:
+        parts.append("Ready to train. A rolling endurance ride is a solid choice today.")
+    else:
+        # Generic endurance
+        state_text = {
+            "Fresh":              "You're well rested",
+            "Ready":              "You're ready to train",
+            "Slight Fatigue":     "Legs are carrying some fatigue",
+            "Productive Fatigue": "You're in a solid loading phase",
+            "Heavy Load":         "Load is building",
+        }.get(classification, "")
+        if state_text:
+            parts.append(f"{state_text} — a steady endurance ride is the right call today.")
 
-    parts.append(state_text + " " + style_text)
-
-    # Goal context
-    if goal and style not in (REST_DAY, RECOVERY_SPIN):
-        if goal == "Build aerobic base":
-            parts.append("Supporting your aerobic base goal.")
+    # --- Goal context (brief, when it changes the suggestion) ---
+    if goal and style not in (REST_DAY, EASY_SPIN, RECOVERY_SPIN):
+        if goal == "Build aerobic base" and style == ENDURANCE_RIDE:
+            parts.append("This supports your aerobic base goal.")
         elif goal == "Raise FTP / threshold" and style == TEMPO_TERRAIN:
             parts.append("Targeting your FTP goal.")
+        elif goal == "Raise FTP / threshold" and style == ENDURANCE_RIDE:
+            parts.append("Legs need a little more recovery before quality FTP work pays off.")
         elif goal == "Prepare for an event":
             parts.append("Keeping event prep on track.")
-        elif goal == "Improve endurance for longer rides" and style == ENDURANCE_RIDE:
-            parts.append("Building endurance for longer rides.")
+        elif goal == "Improve endurance for longer rides" and style == LONG_ENDURANCE:
+            parts.append("Building towards longer rides.")
 
-    # Yesterday note
+    # --- Yesterday note (only if it adds context) ---
     if yesterday_recon and yesterday_recon.state:
         note = {
-            PLAN_COMPLETED:      "Yesterday's session was completed — good work.",
-            PLAN_OVERPERFORMED:  "Yesterday you went beyond the plan — don't over-extend today.",
-            PLAN_UNDERPERFORMED: "Yesterday's effort came in below the plan.",
+            PLAN_OVERPERFORMED:  "Yesterday you went beyond the plan — no need to push again today.",
             PLAN_SKIPPED:        "Yesterday's planned session was missed.",
-            UNPLANNED_RIDE:      "Yesterday's ride was unplanned.",
         }.get(yesterday_recon.state, "")
         if note:
             parts.append(note)

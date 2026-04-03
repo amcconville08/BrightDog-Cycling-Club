@@ -74,6 +74,9 @@ class Poller(threading.Thread):
                 state = coach_mod.TrainingState.from_metrics(values)
                 result = coach_mod.evaluate(state, training_profile=training_profile, planned_workout=pw_dict)
 
+                # Recent rides for pattern analysis
+                recent_rides = db.get_recent_activities(self.db_path, user_id, days=14)
+
                 # Ride style suggestion
                 suggestion = recon_mod.suggest_ride(
                     classification=result.classification,
@@ -83,6 +86,7 @@ class Poller(threading.Thread):
                     training_profile=training_profile,
                     yesterday_recon=yesterday_recon,
                     today_plan=pw_dict,
+                    recent_rides=recent_rides,
                 )
 
                 coaching_dict = result.to_dict()

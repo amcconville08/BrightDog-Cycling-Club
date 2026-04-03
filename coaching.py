@@ -76,19 +76,19 @@ _EASY_SESSION_TYPES = {"recovery", "rest"}
 def classify_tsb(tsb: float) -> tuple:
     """Return (classification, short_recommendation) from TSB value."""
     if tsb >= 10:
-        return "Fresh", "Hard session or test appropriate"
+        return "Fresh", "You're fresh — a harder session would do you good"
     elif tsb >= 0:
-        return "Ready", "Normal training appropriate"
+        return "Ready", "Ready to train — get out and ride"
     elif tsb >= -10:
-        return "Slight Fatigue", "Normal training still fine"
+        return "Slight Fatigue", "Legs are ticking over — steady riding is fine"
     elif tsb >= -25:
-        return "Productive Fatigue", "Moderate to hard training may still be appropriate"
+        return "Productive Fatigue", "Carrying some load — steady work is still productive"
     elif tsb >= -40:
-        return "Heavy Load", "Endurance or controlled session recommended"
+        return "Heavy Load", "Heavy load — keep it controlled today"
     elif tsb >= -60:
-        return "Very Fatigued", "Recovery or easy endurance recommended"
+        return "Very Fatigued", "Legs are well worked — easy today pays off later"
     else:
-        return "Deep Fatigue", "Rest strongly recommended"
+        return "Deep Fatigue", "Body is asking for rest. Take it."
 
 
 def readiness_from_tsb(tsb: float) -> float:
@@ -110,29 +110,29 @@ def evaluate(
     # --- Flags (load spike only) ---
     flags = []
     if ratio > 2.0:
-        flags.append(f"Load spike: fatigue ratio {ratio:.2f} — recent load is {ratio:.1f}× your fitness base.")
+        flags.append(f"Recent load is {ratio:.1f}× your fitness base — the work is going in, just make sure recovery keeps up.")
     elif ratio > 1.5:
-        flags.append(f"Elevated load relative to fitness: ratio {ratio:.2f}.")
+        flags.append(f"Load is running a little ahead of fitness right now (ratio {ratio:.2f}) — worth keeping an eye on.")
 
     # --- Headlines and explanations ---
     headlines = {
-        "Fresh":              "Well rested — good window for a hard session or test.",
-        "Ready":              "Ready to train — normal training load is appropriate.",
-        "Slight Fatigue":     "Slight fatigue — training is still fine and productive.",
-        "Productive Fatigue": "Carrying productive load — moderate to hard sessions are appropriate.",
-        "Heavy Load":         "Significant load accumulated — endurance or controlled effort recommended.",
-        "Very Fatigued":      "High fatigue — easy ride or full recovery session recommended.",
-        "Deep Fatigue":       "Deep fatigue — rest is strongly recommended today.",
+        "Fresh":              "Good window for quality",
+        "Ready":              "Ready to train",
+        "Slight Fatigue":     "Legs are ticking over",
+        "Productive Fatigue": "Carrying good training load",
+        "Heavy Load":         "Heavy load — keep it controlled",
+        "Very Fatigued":      "Legs are well worked",
+        "Deep Fatigue":       "Rest today",
     }
 
     explanations = {
-        "Fresh":              f"TSB is {s.tsb:+.0f}. CTL {s.ctl:.0f} is well expressed — you are fresh and ready.",
-        "Ready":              f"TSB is {s.tsb:+.0f}. Fitness (CTL {s.ctl:.0f}) and load (ATL {s.atl:.0f}) are well balanced.",
-        "Slight Fatigue":     f"TSB is {s.tsb:+.0f}. Small fatigue deficit — this is a normal training state.",
-        "Productive Fatigue": f"TSB is {s.tsb:+.0f}. You are in a productive loading phase (ATL {s.atl:.0f} vs CTL {s.ctl:.0f}).",
-        "Heavy Load":         f"TSB is {s.tsb:+.0f}. Recent load (ATL {s.atl:.0f}) is building above your fitness base (CTL {s.ctl:.0f}).",
-        "Very Fatigued":      f"TSB is {s.tsb:+.0f}. Load (ATL {s.atl:.0f}) substantially exceeds fitness (CTL {s.ctl:.0f}). Time to recover.",
-        "Deep Fatigue":       f"TSB is {s.tsb:+.0f}. Fatigue (ATL {s.atl:.0f}) far exceeds fitness (CTL {s.ctl:.0f}). Rest today.",
+        "Fresh":              f"TSB {s.tsb:+.0f} — fitness ({s.ctl:.0f} CTL) is well expressed and fatigue is low. A good day to push.",
+        "Ready":              f"TSB {s.tsb:+.0f} — fitness and fatigue are nicely balanced ({s.ctl:.0f} CTL / {s.atl:.0f} ATL). Conditions are good.",
+        "Slight Fatigue":     f"TSB {s.tsb:+.0f} — a small fatigue deficit, which is a normal and productive training state.",
+        "Productive Fatigue": f"TSB {s.tsb:+.0f} — you're in a solid loading phase. Recent load ({s.atl:.0f} ATL) is ahead of your base ({s.ctl:.0f} CTL).",
+        "Heavy Load":         f"TSB {s.tsb:+.0f} — recent load ({s.atl:.0f} ATL) has built above your fitness base ({s.ctl:.0f} CTL). A lighter session will help absorb the work.",
+        "Very Fatigued":      f"TSB {s.tsb:+.0f} — accumulated load ({s.atl:.0f} ATL) is well ahead of your base ({s.ctl:.0f} CTL). Letting it settle will pay off.",
+        "Deep Fatigue":       f"TSB {s.tsb:+.0f} — fatigue ({s.atl:.0f} ATL) is significantly above your fitness base ({s.ctl:.0f} CTL). A rest day is the right call.",
     }
 
     risk_map = {
@@ -150,17 +150,17 @@ def evaluate(
 
     # Volume insights
     if s.rolling_7d_hours > 10.0:
-        insights.append(f"Big week: {s.rolling_7d_hours:.1f}h in the last 7 days.")
+        insights.append(f"You've put in {s.rolling_7d_hours:.1f}h over the last 7 days — a big block of work.")
     elif s.rolling_7d_hours > 7.0:
-        insights.append(f"Solid week: {s.rolling_7d_hours:.1f}h in the last 7 days.")
+        insights.append(f"Solid 7 days — {s.rolling_7d_hours:.1f}h of riding in the bank.")
 
     # Fitness base context
     if s.ctl < 40 and s.atl > 55:
-        insights.append("Fitness base is still building — heavy loads have more impact at this stage.")
+        insights.append("Fitness is still building — heavier loads carry a bit more weight at this stage.")
 
     # Calorie deficit
     if s.calorie_balance < -600 and s.daily_tss > 60:
-        insights.append("Significant calorie deficit on a training day — consider improving fuelling.")
+        insights.append("Calorie intake looks low for a training day — worth fuelling a bit more around sessions.")
 
     # --- Training profile context (deterministic, from stored data only) ---
     goal = p.get("goal", "")
@@ -171,49 +171,50 @@ def evaluate(
 
     if effective_goal == "Build aerobic base":
         if classification in ("Fresh", "Ready", "Slight Fatigue", "Productive Fatigue"):
-            insights.append("Goal: aerobic base — conditions are good for an endurance session today.")
+            insights.append("Goal: aerobic base — good conditions for an endurance session today.")
         elif classification in ("Heavy Load", "Very Fatigued"):
-            insights.append("Goal: aerobic base — fatigue is elevated. A lighter session today will still build aerobic fitness.")
+            insights.append("Goal: aerobic base — fatigue is elevated. A lighter session will still contribute to your base.")
 
     elif effective_goal == "Raise FTP / threshold":
         if classification in ("Fresh", "Ready"):
-            insights.append("Goal: raise FTP — readiness is good for quality threshold work.")
+            insights.append("Goal: raise FTP — you're in good shape for quality threshold work today.")
         elif classification in ("Productive Fatigue", "Slight Fatigue"):
-            insights.append("Goal: raise FTP — you can still do quality work, but manage the effort level.")
+            insights.append("Goal: raise FTP — quality work is still possible, but manage the effort level.")
         elif classification in ("Heavy Load", "Very Fatigued", "Deep Fatigue"):
-            insights.append("Goal: raise FTP — fatigue is too high for quality threshold work. Prioritise recovery first.")
+            insights.append("Goal: raise FTP — legs need a bit more time to recover before quality work really pays off.")
 
     elif effective_goal == "Improve endurance for longer rides":
         if classification in ("Fresh", "Ready", "Slight Fatigue"):
-            insights.append("Goal: longer ride endurance — today is a good day for extended aerobic work.")
+            insights.append("Goal: longer rides — today is a good day for extended aerobic work.")
         elif classification in ("Heavy Load", "Very Fatigued"):
-            insights.append("Goal: longer ride endurance — too fatigued for a long effort today. Rest and come back fresh.")
+            insights.append("Goal: longer rides — fatigue is elevated. A lighter day will leave you better placed for a long ride soon.")
 
     elif effective_goal == "Prepare for an event":
         if target_event_date:
             try:
                 days_to_event = (_date.fromisoformat(target_event_date) - _date.today()).days
                 if days_to_event < 0:
-                    pass  # event passed, ignore
+                    pass  # event passed
                 elif days_to_event <= 3:
-                    insights.append(f"Event in {days_to_event} day(s) — keep legs easy and save your energy.")
+                    insights.append(f"Event in {days_to_event} day(s) — keep the legs easy and save your energy.")
                 elif days_to_event <= 7:
-                    insights.append(f"Event in {days_to_event} days — taper is in effect. Short, sharp efforts only.")
+                    insights.append(f"Event in {days_to_event} days — taper week. Short and sharp if you ride at all.")
                 elif days_to_event <= 14:
-                    insights.append(f"Event in {days_to_event} days — begin reducing volume. Maintain some intensity.")
+                    insights.append(f"Event in {days_to_event} days — start easing back on volume. Keep a bit of intensity.")
                 else:
-                    insights.append(f"Event in {days_to_event} days — continue building.")
+                    insights.append(f"Event in {days_to_event} days — keep building.")
             except ValueError:
                 pass
 
     elif effective_goal == "Weight loss while maintaining performance":
         if s.calorie_balance < -400 and classification in ("Heavy Load", "Very Fatigued", "Deep Fatigue"):
-            insights.append("Calorie deficit combined with high training load — fuel harder sessions properly.")
+            insights.append("High load and a calorie deficit — make sure to fuel harder sessions properly.")
 
     # Weekly hours tracking vs target
     if weekly_hours_target > 0 and s.rolling_7d_hours < weekly_hours_target * 0.5:
         insights.append(
-            f"Rolling 7-day hours ({s.rolling_7d_hours:.1f}h) are well below target ({weekly_hours_target:.0f}h)."
+            f"7-day hours ({s.rolling_7d_hours:.1f}h) are below your weekly target ({weekly_hours_target:.0f}h) — "
+            "a quieter week, but it still counts."
         )
 
     # --- Planned workout context ---
@@ -223,26 +224,26 @@ def evaluate(
         if pw_type in _HARD_SESSION_TYPES:
             if classification in ("Very Fatigued", "Deep Fatigue"):
                 insights.append(
-                    f"Planned '{pw_title}' is a hard session — readiness is low. "
-                    "Consider reducing intensity or moving it by a day."
+                    f"Planned '{pw_title}' — legs are carrying a lot right now. "
+                    "Backing off the intensity or shifting it a day would help you get more from it."
                 )
             elif classification in ("Fresh", "Ready"):
-                insights.append(f"Planned '{pw_title}' — readiness is good. Well placed.")
+                insights.append(f"Planned '{pw_title}' — readiness looks good for it.")
             elif classification in ("Heavy Load", "Productive Fatigue"):
                 insights.append(
-                    f"Planned '{pw_title}' — you are carrying some load. Proceed carefully and listen to your body."
+                    f"Planned '{pw_title}' — you're carrying some load. Listen to your body and adjust if needed."
                 )
         elif pw_type == "endurance":
             if classification in ("Productive Fatigue", "Heavy Load"):
-                insights.append(f"Planned '{pw_title}' (endurance) — a steady aerobic ride is a good fit right now.")
+                insights.append(f"Planned '{pw_title}' — a steady aerobic ride is a good fit for where you are right now.")
             elif classification in ("Fresh", "Ready"):
-                insights.append(f"Planned '{pw_title}' — looks well matched to where you are today.")
+                insights.append(f"Planned '{pw_title}' — well matched to today.")
         elif pw_type in _EASY_SESSION_TYPES:
             if classification in ("Very Fatigued", "Deep Fatigue", "Heavy Load"):
-                insights.append(f"Planned '{pw_title}' — exactly the right call given current fatigue.")
+                insights.append(f"Planned '{pw_title}' — exactly the right call today.")
             elif classification in ("Fresh", "Ready"):
                 insights.append(
-                    f"Planned '{pw_title}' — you are fresh, but easy sessions help consolidate recent training."
+                    f"Planned '{pw_title}' — you're fresh, but an easy session helps consolidate recent work."
                 )
 
     return CoachingResult(

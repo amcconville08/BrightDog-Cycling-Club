@@ -503,19 +503,32 @@ def dashboard():
     has_strava = db.get_strava_tokens(DB_PATH, user["id"]) is not None
     today_str = date.today().isoformat()
     today_workout = db.get_today_workout(DB_PATH, user["id"], today_str)
+    profile = db.get_training_profile(DB_PATH, user["id"])
 
     classification = coaching.get("classification", "—")
     readiness = coaching.get("readiness_score", 0)
-    headline = coaching.get("headline", "Syncing your data..." if has_strava else "Connect Strava to get started.")
-
+    recommendation = coaching.get("recommendation", "")
     sc = status_color(classification)
     sb = status_bg(classification)
 
-    # Readiness card
-    readiness_card = f"""
-<div class="bg-gray-900 rounded-xl p-5 mb-3 flex items-center gap-4">
-  <div class="relative w-20 h-20 flex-shrink-0">
-    <svg class="w-20 h-20 -rotate-90" viewBox="0 0 36 36">
+    # ------------------------------------------------------------------
+    # CARD 1 — Status hero (taps through to Coach screen)
+    # ------------------------------------------------------------------
+    if not has_strava:
+        status_body = '<p class="text-sm text-gray-400">Connect Strava to get started.</p>'
+        status_sub = ""
+    elif not coaching:
+        status_body = '<p class="text-sm text-gray-400">Syncing your data — check back shortly.</p>'
+        status_sub = ""
+    else:
+        status_body = f'<span class="inline-block px-2.5 py-0.5 rounded-full text-sm font-semibold {sc} {sb}">{classification}</span>'
+        status_sub = f'<p class="text-base text-gray-200 mt-2 leading-snug font-medium">{recommendation}</p>'
+
+    status_card = f"""
+<a href="{url_for('coaching')}" class="block">
+<div class="bg-gray-900 rounded-xl p-5 mb-3 flex items-center gap-4 active:opacity-80">
+  <div class="relative w-16 h-16 flex-shrink-0">
+    <svg class="w-16 h-16 -rotate-90" viewBox="0 0 36 36">
       <circle cx="18" cy="18" r="15.9" fill="none" stroke="#1f2937" stroke-width="3"/>
       <circle cx="18" cy="18" r="15.9" fill="none"
         stroke="{status_hex(classification)}" stroke-width="3"
@@ -523,285 +536,266 @@ def dashboard():
         stroke-linecap="round"/>
     </svg>
     <div class="absolute inset-0 flex items-center justify-center">
-      <span class="text-lg font-bold text-gray-100">{readiness:.0f}</span>
+      <span class="text-sm font-bold text-gray-100">{readiness:.0f}</span>
     </div>
   </div>
   <div class="flex-1 min-w-0">
     <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1">Readiness</p>
-    <span class="inline-block px-2 py-0.5 rounded-full text-xs font-semibold {sc} {sb} mb-1">{classification}</span>
-    <p class="text-sm text-gray-300 leading-snug">{headline}</p>
+    {status_body}
+    {status_sub}
   </div>
+  <span class="text-gray-600 text-lg flex-shrink-0">›</span>
 </div>
+</a>
 """
 
-    # Fitness metrics row
-    ctl = coaching.get("ctl", 0)
-    atl = coaching.get("atl", 0)
-    tsb = coaching.get("tsb", 0)
-    tsb_color = "text-green-400" if tsb >= 0 else "text-red-400"
-    tsb_sign = "+" if tsb >= 0 else ""
-
-    # FTP card with change indicator
-    current_ftp = db.get_current_ftp(DB_PATH, user["id"])
-    prev_ftp_row = db.get_previous_ftp(DB_PATH, user["id"])
-    ftp_delta_html = ""
-    if prev_ftp_row:
-        prev_ftp = float(prev_ftp_row["ftp_watts"])
-        delta = current_ftp - prev_ftp
-        if abs(delta) >= 1:
-            d_color = "text-green-400" if delta > 0 else "text-red-400"
-            d_sign = "+" if delta > 0 else ""
-            ftp_delta_html = f'<span class="{d_color} text-xs font-medium ml-1">{d_sign}{delta:.0f}W</span>'
-
-    # CTL change
-    prev_ctl = float(mc["prev_ctl"]) if mc and mc["prev_ctl"] else 0
-    ctl_delta = ctl - prev_ctl
-    ctl_delta_html = ""
-    if abs(ctl_delta) >= 0.5 and prev_ctl > 0:
-        d_color = "text-green-400" if ctl_delta > 0 else "text-red-400"
-        d_sign = "+" if ctl_delta > 0 else ""
-        ctl_delta_html = f'<p class="text-xs {d_color} mt-0.5">{d_sign}{ctl_delta:.1f} vs 7d ago</p>'
-
-    metrics_card = f"""
-<div class="bg-gray-900 rounded-xl p-4 mb-3">
-  <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3">Fitness</p>
-  <div class="grid grid-cols-4 gap-2 text-center">
-    <div>
-      <p class="text-xl font-bold text-blue-400">{ctl:.0f}</p>
-      {ctl_delta_html}
-      <p class="text-xs text-gray-500 mt-1">CTL</p>
-    </div>
-    <div>
-      <p class="text-xl font-bold text-purple-400">{atl:.0f}</p>
-      <p class="text-xs text-gray-500 mt-1">ATL</p>
-    </div>
-    <div>
-      <p class="text-xl font-bold {tsb_color}">{tsb_sign}{tsb:.0f}</p>
-      <p class="text-xs text-gray-500 mt-1">TSB</p>
-    </div>
-    <div>
-      <p class="text-xl font-bold text-gray-200">{current_ftp:.0f}{ftp_delta_html}</p>
-      <p class="text-xs text-gray-500 mt-1">FTP</p>
-    </div>
-  </div>
-</div>
-"""
-
-    # Today's planned workout card
-    workout_card = ""
-    if today_workout:
-        pw = dict(today_workout)
-        dur_str = f"{pw['target_duration_min']}min" if pw.get("target_duration_min") else ""
-        tss_str = f"{pw['target_tss']:.0f} TSS" if pw.get("target_tss") else ""
-        details = " · ".join(filter(None, [dur_str, tss_str]))
-        workout_card = f"""
-<div class="bg-gray-900 border border-gray-700 rounded-xl p-4 mb-3">
-  <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Today's Workout</p>
-  <div class="flex items-start justify-between">
-    <div>
-      <p class="text-sm font-semibold text-gray-100">{pw['title']}</p>
-      <div class="mt-1">{_workout_type_badge(pw['type'])}</div>
-      {f'<p class="text-xs text-gray-500 mt-1">{details}</p>' if details else ''}
-      {f'<p class="text-xs text-gray-400 mt-1 italic">{pw["notes"]}</p>' if pw.get("notes") else ''}
-    </div>
-    <a href="{url_for('coaching')}" class="text-xs text-cyan-500 hover:text-cyan-300 mt-1">Coaching →</a>
-  </div>
-</div>
-"""
-
-    # Last ride card
-    if mc:
-        last_dist = fmt_dist(mc["last_distance_m"])
-        last_time = fmt_time(mc["last_moving_time_s"])
-        last_elev = fmt_elev(mc["last_elevation_m"])
-        last_date = fmt_date(mc["last_start_ts"])
-        last_watts = f'{mc["last_avg_watts"]:.0f} W' if mc["last_avg_watts"] else "—"
-        last_ride_body = f"""
-<div class="flex items-baseline justify-between mb-1">
-  <p class="text-2xl font-bold text-gray-100">{last_dist}</p>
-  <p class="text-sm text-gray-400">{last_date}</p>
-</div>
-<div class="flex gap-4 text-sm text-gray-400">
-  <span>⏱ {last_time}</span>
-  <span>⛰ {last_elev}</span>
-  <span>⚡ {last_watts}</span>
-</div>
-"""
-    else:
-        last_ride_body = '<p class="text-sm text-gray-500">No ride data yet.</p>'
-
-    last_ride_card = _card("Last Ride", last_ride_body)
-
-    # This week card (rolling 7d as fallback when current week is early)
-    if mc:
-        weekly_tss = float(mc["weekly_tss"] or 0) if "weekly_tss" in mc.keys() else 0.0
-        week_longest = float(mc["weekly_longest_distance_m"] or 0) if "weekly_longest_distance_m" in mc.keys() else 0.0
-        wc = int(mc["weekly_count"] or 0)
-
-        week_body = f"""
-<div class="grid grid-cols-3 gap-2 text-center mb-3">
-  <div>
-    <p class="text-lg font-bold text-gray-100">{fmt_dist(mc['weekly_distance_m'])}</p>
-    <p class="text-xs text-gray-500">Distance</p>
-  </div>
-  <div>
-    <p class="text-lg font-bold text-gray-100">{fmt_time(mc['weekly_moving_time_s'])}</p>
-    <p class="text-xs text-gray-500">Moving time</p>
-  </div>
-  <div>
-    <p class="text-lg font-bold text-gray-100">{wc}</p>
-    <p class="text-xs text-gray-500">Rides</p>
-  </div>
-</div>
-<div class="grid grid-cols-2 gap-2 text-center">
-  <div>
-    <p class="text-base font-bold text-yellow-400">{weekly_tss:.0f}</p>
-    <p class="text-xs text-gray-500">TSS</p>
-  </div>
-  <div>
-    <p class="text-base font-bold text-gray-300">{fmt_dist(week_longest)}</p>
-    <p class="text-xs text-gray-500">Longest ride</p>
-  </div>
-</div>"""
-        if wc > 0:
-            avg_tss = weekly_tss / wc
-            week_body += f"""
-<p class="text-xs text-gray-500 mt-3 leading-relaxed">
-  {wc} ride{'s' if wc != 1 else ''} · {fmt_dist(mc['weekly_distance_m'])} · {weekly_tss:.0f} TSS · avg {avg_tss:.0f} TSS/ride
-</p>"""
-    else:
-        week_body = '<p class="text-sm text-gray-500">No data.</p>'
-
-    week_card = _card("This Week", week_body)
-
-    # This month card
-    if mc:
-        month_body = f"""
-<div class="grid grid-cols-2 gap-2 text-center">
-  <div>
-    <p class="text-lg font-bold text-gray-100">{fmt_dist(mc['monthly_distance_m'])}</p>
-    <p class="text-xs text-gray-500">Distance</p>
-  </div>
-  <div>
-    <p class="text-lg font-bold text-gray-100">{mc['monthly_count']}</p>
-    <p class="text-xs text-gray-500">Rides</p>
-  </div>
-</div>"""
-    else:
-        month_body = '<p class="text-sm text-gray-500">No data.</p>'
-
-    month_card = _card("This Month", month_body)
-
-    # Training profile teaser
-    profile = db.get_training_profile(DB_PATH, user["id"])
-    goal = profile.get("goal", "")
-    goal_custom = profile.get("goal_custom", "")
-    effective_goal = goal_custom.strip() if goal == "Custom" and goal_custom.strip() else goal
-
-    if effective_goal:
-        profile_card = f"""
-<div class="bg-gray-900 rounded-xl p-4 mb-3 flex items-center justify-between">
-  <div>
-    <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1">Current Goal</p>
-    <p class="text-sm text-gray-200">{effective_goal}</p>
-  </div>
-  <a href="{url_for('training_profile')}" class="text-xs text-cyan-500 hover:text-cyan-300">Edit</a>
-</div>
-"""
-    else:
-        profile_card = f"""
-<div class="bg-cyan-900/20 border border-cyan-700/40 rounded-xl p-4 mb-3">
-  <p class="text-sm text-cyan-300 mb-2">Set your training goal to get personalised coaching.</p>
-  <a href="{url_for('training_profile')}"
-     class="inline-block bg-cyan-700 hover:bg-cyan-600 text-white text-xs font-semibold px-3 py-1.5 rounded-lg transition-colors">
-    Set goal
-  </a>
-</div>
-"""
-
-    # Today's Training Decision card
+    # ------------------------------------------------------------------
+    # CARD 2 — Today's Ride (taps through to Coach screen)
+    # ------------------------------------------------------------------
     ride_style = coaching.get("ride_style", "")
+    ride_hint = coaching.get("ride_hint", "")
     ride_rationale = coaching.get("ride_style_rationale", "")
     suggested_dur = coaching.get("suggested_duration_minutes", 0)
     suggested_tss = coaching.get("suggested_tss", 0)
 
-    training_decision_card = ""
+    ride_card = ""
     if ride_style and has_strava:
         style_icon = recon_mod.STYLE_ICONS.get(ride_style, "🚴")
         dur_str = f"{suggested_dur} min" if suggested_dur else ""
         tss_str = f"~{suggested_tss} TSS" if suggested_tss else ""
-        details_str = " · ".join(filter(None, [dur_str, tss_str]))
-        training_decision_card = f"""
-<div class="bg-gray-900 rounded-xl p-4 mb-3">
-  <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Today's Training Decision</p>
-  <div class="flex items-start justify-between mb-2">
-    <div>
-      <p class="text-base font-bold text-gray-100">{style_icon} {ride_style}</p>
-      {f'<p class="text-xs text-gray-500 mt-0.5">{details_str}</p>' if details_str else ''}
+        meta_str = " · ".join(filter(None, [dur_str, tss_str]))
+
+        # Note if a workout is planned for today
+        plan_note = ""
+        if today_workout:
+            pw = dict(today_workout)
+            plan_note = f'<p class="text-xs text-gray-600 mt-2">Planned: {pw["title"]}</p>'
+
+        ride_card = f"""
+<a href="{url_for('coaching')}" class="block">
+<div class="bg-gray-900 rounded-xl p-4 mb-3 active:opacity-80">
+  <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-3">Today's Ride</p>
+  <div class="flex items-start justify-between">
+    <div class="flex-1 min-w-0">
+      <p class="text-xl font-bold text-gray-100">{style_icon} {ride_style}</p>
+      {f'<p class="text-xs text-gray-500 mt-1">{meta_str}</p>' if meta_str else ''}
+      {f'<p class="text-sm text-gray-400 mt-2 leading-relaxed italic">{ride_hint}</p>' if ride_hint else ''}
+      {plan_note}
     </div>
-    <a href="{url_for('coaching')}" class="text-xs text-cyan-500 hover:text-cyan-300 mt-0.5">Detail →</a>
+    <span class="text-gray-600 text-lg ml-3 flex-shrink-0">›</span>
   </div>
-  {f'<p class="text-sm text-gray-400 leading-relaxed">{ride_rationale}</p>' if ride_rationale else ''}
 </div>
+</a>
 """
-
-    # Yesterday vs Plan card
-    recon_state = coaching.get("recon_state")
-    yesterday_card = ""
-    if recon_state and has_strava:
-        label, color, icon = recon_mod.RECON_LABELS.get(
-            recon_state, (recon_state, "text-gray-400", "?"))
-        recon_planned_title = coaching.get("recon_planned_title", "")
-        recon_actual_name = coaching.get("recon_actual_name", "")
-        recon_planned_tss = coaching.get("recon_planned_tss", 0)
-        recon_actual_tss = coaching.get("recon_actual_tss", 0)
-
-        tss_line = ""
-        if recon_state not in (recon_mod.UNPLANNED_RIDE, recon_mod.PLAN_SKIPPED):
-            tss_line = f'<p class="text-xs text-gray-500 mt-1">{recon_actual_tss:.0f} TSS actual · {recon_planned_tss:.0f} TSS planned</p>'
-        elif recon_state == recon_mod.UNPLANNED_RIDE and recon_actual_tss:
-            tss_line = f'<p class="text-xs text-gray-500 mt-1">{recon_actual_tss:.0f} TSS</p>'
-
-        name_line = recon_actual_name or recon_planned_title
-        yesterday_card = f"""
+    elif has_strava and not coaching:
+        ride_card = f"""
 <div class="bg-gray-900 rounded-xl p-4 mb-3">
-  <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Yesterday vs Plan</p>
-  <div class="flex items-center gap-2">
-    <span class="{color} text-sm font-semibold">{icon} {label}</span>
-    {f'<span class="text-xs text-gray-500">· {name_line}</span>' if name_line else ''}
-  </div>
-  {tss_line}
+  <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-2">Today's Ride</p>
+  <p class="text-sm text-gray-500">Syncing — back shortly.</p>
 </div>
 """
 
-    # Strava connect prompt
+    # ------------------------------------------------------------------
+    # CARD 3 — This Week (with inline <details> expand for more)
+    # ------------------------------------------------------------------
+    if mc:
+        weekly_tss = float(mc["weekly_tss"] or 0) if "weekly_tss" in mc.keys() else 0.0
+        week_longest = float(mc["weekly_longest_distance_m"] or 0) if "weekly_longest_distance_m" in mc.keys() else 0.0
+        wc = int(mc["weekly_count"] or 0)
+        wt = fmt_time(mc["weekly_moving_time_s"])
+
+        # TSS progress bar
+        weekly_tss_target = float(profile.get("weekly_tss_target") or 0) if profile else 0.0
+        tss_bar = ""
+        if weekly_tss_target > 0:
+            pct = min(100, int(weekly_tss / weekly_tss_target * 100))
+            bar_color = "bg-cyan-500" if pct < 100 else "bg-green-500"
+            if pct >= 110:
+                bar_color = "bg-yellow-500"
+            tss_bar = f"""
+<div class="mt-3">
+  <div class="flex justify-between text-xs text-gray-500 mb-1">
+    <span>{weekly_tss:.0f} TSS</span><span>{pct}% of target</span>
+  </div>
+  <div class="w-full bg-gray-800 rounded-full h-1.5">
+    <div class="{bar_color} h-1.5 rounded-full" style="width:{pct}%"></div>
+  </div>
+</div>"""
+
+        week_summary = f"{wc} ride{'s' if wc != 1 else ''} · {wt}"
+        if not weekly_tss_target and weekly_tss > 0:
+            week_summary += f" · {weekly_tss:.0f} TSS"
+
+        # Monthly stats live in the details expand
+        month_detail = ""
+        if mc:
+            month_detail = f"""
+<div class="pt-3 mt-3 border-t border-gray-800">
+  <p class="text-xs font-semibold text-gray-600 uppercase tracking-wider mb-2">This Month</p>
+  <div class="grid grid-cols-3 gap-2 text-center">
+    <div>
+      <p class="text-sm font-bold text-gray-300">{fmt_dist(mc['monthly_distance_m'])}</p>
+      <p class="text-xs text-gray-600">Distance</p>
+    </div>
+    <div>
+      <p class="text-sm font-bold text-gray-300">{mc['monthly_count']}</p>
+      <p class="text-xs text-gray-600">Rides</p>
+    </div>
+    <div>
+      <p class="text-sm font-bold text-gray-300">{fmt_elev(mc['weekly_elevation_m'])}</p>
+      <p class="text-xs text-gray-600">Week elev</p>
+    </div>
+  </div>
+</div>"""
+
+        week_card = f"""
+<div class="bg-gray-900 rounded-xl p-4 mb-3">
+  <details>
+    <summary class="flex items-center justify-between cursor-pointer list-none">
+      <div>
+        <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1">This Week</p>
+        <p class="text-base font-bold text-gray-100">{week_summary}</p>
+      </div>
+      <span class="text-gray-600 text-lg">›</span>
+    </summary>
+    <div class="mt-3 grid grid-cols-3 gap-2 text-center">
+      <div>
+        <p class="text-sm font-bold text-gray-200">{fmt_dist(mc['weekly_distance_m'])}</p>
+        <p class="text-xs text-gray-500">Distance</p>
+      </div>
+      <div>
+        <p class="text-sm font-bold text-yellow-400">{weekly_tss:.0f}</p>
+        <p class="text-xs text-gray-500">TSS</p>
+      </div>
+      <div>
+        <p class="text-sm font-bold text-gray-200">{fmt_dist(week_longest)}</p>
+        <p class="text-xs text-gray-500">Longest</p>
+      </div>
+    </div>
+    {tss_bar}
+    {month_detail}
+  </details>
+</div>
+"""
+    else:
+        week_card = _card("This Week", '<p class="text-sm text-gray-500">No data yet.</p>')
+
+    # ------------------------------------------------------------------
+    # CARD 4 — Last Ride (with inline <details> expand)
+    # ------------------------------------------------------------------
+    if mc and mc["last_start_ts"]:
+        last_dist = fmt_dist(mc["last_distance_m"])
+        last_time = fmt_time(mc["last_moving_time_s"])
+        last_date = fmt_date(mc["last_start_ts"])
+        last_elev = fmt_elev(mc["last_elevation_m"])
+        last_watts = f'{mc["last_avg_watts"]:.0f} W' if mc["last_avg_watts"] else "—"
+
+        last_ride_card = f"""
+<div class="bg-gray-900 rounded-xl p-4 mb-3">
+  <details>
+    <summary class="flex items-center justify-between cursor-pointer list-none">
+      <div>
+        <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1">Last Ride</p>
+        <p class="text-base font-bold text-gray-100">{last_dist}</p>
+        <p class="text-xs text-gray-500 mt-0.5">{last_date} · {last_time}</p>
+      </div>
+      <span class="text-gray-600 text-lg">›</span>
+    </summary>
+    <div class="mt-3 grid grid-cols-3 gap-2 text-center border-t border-gray-800 pt-3">
+      <div>
+        <p class="text-sm font-bold text-gray-200">{last_time}</p>
+        <p class="text-xs text-gray-500">Duration</p>
+      </div>
+      <div>
+        <p class="text-sm font-bold text-gray-200">{last_elev}</p>
+        <p class="text-xs text-gray-500">Elevation</p>
+      </div>
+      <div>
+        <p class="text-sm font-bold text-gray-200">{last_watts}</p>
+        <p class="text-xs text-gray-500">Avg power</p>
+      </div>
+    </div>
+  </details>
+</div>
+"""
+    else:
+        last_ride_card = _card("Last Ride", '<p class="text-sm text-gray-500">No ride data yet.</p>')
+
+    # ------------------------------------------------------------------
+    # CARD 5 — Goal
+    # ------------------------------------------------------------------
+    goal = profile.get("goal", "") if profile else ""
+    goal_custom = profile.get("goal_custom", "") if profile else ""
+    effective_goal = goal_custom.strip() if goal == "Custom" and goal_custom.strip() else goal
+    target_event_date = profile.get("target_event_date", "") if profile else ""
+    target_event_name = profile.get("target_event_name", "") if profile else ""
+
+    event_line = ""
+    if effective_goal and target_event_date:
+        try:
+            days_left = (date.fromisoformat(target_event_date) - date.today()).days
+            if days_left >= 0:
+                event_label = target_event_name or "Event"
+                event_line = f'<p class="text-xs text-gray-500 mt-1">{event_label} · {days_left} days away</p>'
+        except ValueError:
+            pass
+
+    if effective_goal:
+        goal_card = f"""
+<a href="{url_for('training_profile')}" class="block">
+<div class="bg-gray-900 rounded-xl p-4 mb-3 flex items-center justify-between active:opacity-80">
+  <div>
+    <p class="text-xs font-semibold text-gray-500 uppercase tracking-wider mb-1">Goal</p>
+    <p class="text-sm font-medium text-gray-200">{effective_goal}</p>
+    {event_line}
+  </div>
+  <span class="text-gray-600 text-lg">›</span>
+</div>
+</a>
+"""
+    else:
+        goal_card = f"""
+<a href="{url_for('training_profile')}" class="block">
+<div class="bg-cyan-900/20 border border-cyan-700/40 rounded-xl p-4 mb-3 flex items-center justify-between active:opacity-80">
+  <div>
+    <p class="text-xs font-semibold text-cyan-600 uppercase tracking-wider mb-1">Goal</p>
+    <p class="text-sm text-cyan-300">Set a training goal for personalised coaching →</p>
+  </div>
+</div>
+</a>
+"""
+
+    # ------------------------------------------------------------------
+    # Strava connect prompt (only when not connected)
+    # ------------------------------------------------------------------
     strava_prompt = ""
     if not has_strava:
         strava_prompt = f"""
-<div class="bg-orange-900/20 border border-orange-700/50 rounded-xl p-4 mb-3">
-  <p class="text-sm text-orange-300 mb-2">Connect Strava to see your fitness metrics.</p>
-  <a href="{url_for('connect_strava')}"
-     class="inline-block bg-orange-500 hover:bg-orange-400 text-white text-sm font-semibold px-4 py-2 rounded-lg transition-colors">
-    Connect Strava
-  </a>
+<a href="{url_for('connect_strava')}" class="block">
+<div class="bg-orange-900/20 border border-orange-700/50 rounded-xl p-4 mb-3 flex items-center justify-between active:opacity-80">
+  <div>
+    <p class="text-sm font-semibold text-orange-300">Connect Strava</p>
+    <p class="text-xs text-gray-500 mt-0.5">Link your account to see fitness metrics</p>
+  </div>
+  <span class="text-orange-400 text-lg">›</span>
 </div>
+</a>
 """
 
     updated_at = ""
-    if mc and mc["updated_at"]:
-        updated_at = f'<p class="text-xs text-gray-600 text-center mt-2">Updated {mc["updated_at"]} UTC</p>'
+    if mc and mc.get("updated_at"):
+        updated_at = f'<p class="text-xs text-gray-700 text-center mt-2">Synced {mc["updated_at"][:16]} UTC</p>'
 
-    body = (strava_prompt + readiness_card + training_decision_card +
-            workout_card + yesterday_card + metrics_card +
-            profile_card + last_ride_card + week_card + month_card + updated_at)
+    body = (strava_prompt + status_card + ride_card + week_card +
+            last_ride_card + goal_card + updated_at)
 
     html = (
-        _head(f"Dashboard — {user['name']}")
+        _head(f"Home — {user['name']}")
         + f"""
 <div class="max-w-lg mx-auto px-4 pt-6 pb-4">
   <div class="flex items-center justify-between mb-4">
     <div>
-      <h1 class="text-lg font-bold text-gray-100">Hi, {user['name'].split()[0]}</h1>
+      <h1 class="text-lg font-bold text-gray-100">Hi, {user['name'].split()[0]} 👋</h1>
       <p class="text-xs text-gray-500">{datetime.now(timezone.utc).strftime('%A %-d %B')}</p>
     </div>
     <a href="{url_for('logout')}" class="text-xs text-gray-600 hover:text-gray-400">Sign out</a>
