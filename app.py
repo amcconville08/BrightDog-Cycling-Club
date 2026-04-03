@@ -525,6 +525,8 @@ def dashboard():
         status_body = f'<span class="inline-block px-2.5 py-0.5 rounded-full text-sm font-semibold {sc} {sb}">{classification}</span>'
         status_sub = f'<p class="text-base text-gray-200 mt-2 leading-snug font-medium">{recommendation}</p>'
 
+    ctl = coaching.get("ctl", 0)
+
     status_card = f"""
 <a href="{url_for('coaching')}" class="block">
 <div class="bg-gray-900 rounded-xl p-5 mb-3 flex items-center gap-4 active:opacity-80">
@@ -536,8 +538,9 @@ def dashboard():
         stroke-dasharray="{readiness:.0f} 100"
         stroke-linecap="round"/>
     </svg>
-    <div class="absolute inset-0 flex items-center justify-center">
-      <span class="text-sm font-bold text-gray-100">{readiness:.0f}</span>
+    <div class="absolute inset-0 flex flex-col items-center justify-center">
+      <span class="text-sm font-bold text-gray-100 leading-none">{ctl:.0f}</span>
+      <span class="text-gray-500 leading-none" style="font-size:9px">CTL</span>
     </div>
   </div>
   <div class="flex-1 min-w-0">
