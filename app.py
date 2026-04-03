@@ -498,7 +498,8 @@ def disconnect_strava():
 @login_required
 def dashboard():
     user = g.user
-    mc = db.get_metrics_cache(DB_PATH, user["id"])
+    mc_row = db.get_metrics_cache(DB_PATH, user["id"])
+    mc = dict(mc_row) if mc_row else None
     coaching = db.get_coaching_cache(DB_PATH, user["id"])
     has_strava = db.get_strava_tokens(DB_PATH, user["id"]) is not None
     today_str = date.today().isoformat()
