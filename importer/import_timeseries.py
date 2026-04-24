@@ -48,6 +48,17 @@ _MMP_DURATIONS = {                      # durations for mean-maximal power
     "best_60min": 3600,
 }
 
+# ── Athlete-specific power validation ─────────────────────────────────────
+# Before this date, multiple inaccurate/trial power meters were in use.
+# Power data from these activities must not be used for FTP modelling,
+# power curve analysis, or best-effort detection.
+# Accurate power meter installed: 25 June 2018.
+_POWER_TRUST_CUTOFF = "2018-06-25"   # ISO date string (exclusive lower bound)
+_POWER_EXCLUSION_MSG = (
+    "Pre-2018-06-25: inaccurate power meter period — "
+    "data excluded from power modelling"
+)
+
 # Activities to target: sport matches or indoor cycling sub-sport
 _CYCLING_WHERE = """
     (
@@ -365,24 +376,38 @@ def _compute_performance(records: list, activity: dict, bests: dict) -> dict:
     # Score = % of records with non-zero power
     quality = int(round(len(pwr_vals) / total * 100)) if total else 0
 
+    # ── Power trust flag (athlete-specific validation rule) ───────────────
+    # Activities before 2018-06-25 used inaccurate/trial power meters.
+    # Mark as untrusted so reports can exclude them from modelling.
+    # HR data, metadata, and distance/duration remain valid.
+    activity_date = (activity.get("start_time") or "")[:10]
+    if activity_date and activity_date < _POWER_TRUST_CUTOFF:
+        power_trusted = 0
+        power_exclusion_reason = _POWER_EXCLUSION_MSG
+    else:
+        power_trusted = 1
+        power_exclusion_reason = None
+
     return {
-        "hr_avg":              hr_avg,
-        "hr_max":              hr_max,
-        "hr_drift_pct":        hr_drift,
-        "power_avg":           power_avg,
-        "power_np":            power_np,
-        "power_max":           power_max,
-        "power_vi":            power_vi,
-        "aerobic_efficiency":  ae,
-        "ftp_candidate_w":     ftp_w,
-        "ftp_basis":           ftp_basis,
-        "total_records":       total,
-        "records_with_power":  len(pwr_vals),
-        "records_with_hr":     len(hr_vals),
-        "power_quality_score": quality,
-        "has_power_stream":    1 if pwr_vals else 0,
-        "has_hr_stream":       1 if hr_vals  else 0,
-        "has_gps_stream":      1 if lat_vals else 0,
+        "hr_avg":                 hr_avg,
+        "hr_max":                 hr_max,
+        "hr_drift_pct":           hr_drift,
+        "power_avg":              power_avg,
+        "power_np":               power_np,
+        "power_max":              power_max,
+        "power_vi":               power_vi,
+        "aerobic_efficiency":     ae,
+        "ftp_candidate_w":        ftp_w,
+        "ftp_basis":              ftp_basis,
+        "total_records":          total,
+        "records_with_power":     len(pwr_vals),
+        "records_with_hr":        len(hr_vals),
+        "power_quality_score":    quality,
+        "has_power_stream":       1 if pwr_vals else 0,
+        "has_hr_stream":          1 if hr_vals  else 0,
+        "has_gps_stream":         1 if lat_vals else 0,
+        "power_trusted":          power_trusted,
+        "power_exclusion_reason": power_exclusion_reason,
     }
 
 
@@ -436,8 +461,9 @@ def _upsert_performance(conn: sqlite3.Connection,
             total_records, records_with_power, records_with_hr,
             power_quality_score,
             has_power_stream, has_hr_stream, has_gps_stream,
+            power_trusted, power_exclusion_reason,
             computed_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             activity_id,
             perf.get("hr_avg"),         perf.get("hr_max"),
@@ -452,6 +478,8 @@ def _upsert_performance(conn: sqlite3.Connection,
             perf.get("has_power_stream", 0),
             perf.get("has_hr_stream",    0),
             perf.get("has_gps_stream",   0),
+            perf.get("power_trusted", 1),
+            perf.get("power_exclusion_reason"),
             _now(),
         ),
     )

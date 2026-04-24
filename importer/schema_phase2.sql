@@ -77,6 +77,12 @@ CREATE TABLE IF NOT EXISTS activity_performance (
     has_hr_stream         INTEGER NOT NULL DEFAULT 0,
     has_gps_stream        INTEGER NOT NULL DEFAULT 0,
 
+    -- Athlete-specific power validation
+    -- power_trusted = 0 when activity predates the accurate power meter install (2018-06-25).
+    -- Raw stream data is preserved; this flag controls inclusion in modelling reports.
+    power_trusted         INTEGER NOT NULL DEFAULT 1,
+    power_exclusion_reason TEXT,
+
     computed_at           TEXT NOT NULL
 );
 

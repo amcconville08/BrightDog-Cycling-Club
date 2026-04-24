@@ -5,11 +5,17 @@ Usage:
     python importer/generate_phase2_reports.py
 
 Output (data/reports/):
-    power_curve_by_year.csv        Best MMP per duration per year
-    best_efforts_by_year.csv       Top-3 efforts per duration per year
-    aerobic_efficiency_by_year.csv Efficiency Factor trend by year
-    power_data_quality.csv         Quality score per power activity
-    candidate_ftp_history.csv      FTP estimates in date order
+    power_curve_by_year.csv             Best MMP per duration per year (trusted power only)
+    best_efforts_by_year.csv            Top-3 efforts per duration per year (trusted power only)
+    aerobic_efficiency_by_year.csv      Efficiency Factor trend by year
+    power_data_quality.csv              Quality score per power activity
+    candidate_ftp_history_filtered.csv  FTP estimates in date order (trusted power only)
+
+Athlete-specific validation rule:
+    Power data before 2018-06-25 is excluded from power modelling reports.
+    Reason: multiple inaccurate/trial power meters were in use before this date.
+    Accurate power meter installed: 25 June 2018.
+    HR data, ride metadata, and aerobic efficiency metrics remain included for all dates.
 """
 import csv
 import os
@@ -25,6 +31,8 @@ REPORTS_DIR  = PROJECT_ROOT / "data" / "reports"
 
 _MMP_COLS = ["best_5s", "best_30s", "best_1min",
              "best_5min", "best_10min", "best_20min", "best_60min"]
+
+_POWER_TRUST_CUTOFF = "2018-06-25"   # matches import_timeseries.py constant
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────
@@ -57,7 +65,8 @@ def _year(iso: str | None) -> str | None:
 def power_curve_by_year(conn: sqlite3.Connection) -> None:
     """
     Best MMP for each standard duration, grouped by year.
-    Only activities where power_quality_score >= 50 are counted.
+    Only activities where power_quality_score >= 50 AND power_trusted = 1 are counted.
+    Activities before 2018-06-25 are excluded (inaccurate power meter period).
     """
     col_list = ", ".join(f"MAX(pb.{c}) AS {c}" for c in _MMP_COLS)
     rows = conn.execute(f"""
@@ -70,6 +79,7 @@ def power_curve_by_year(conn: sqlite3.Connection) -> None:
         JOIN activity_performance ap ON ap.activity_id = pb.activity_id
         WHERE am.start_time IS NOT NULL
           AND ap.power_quality_score >= 50
+          AND ap.power_trusted = 1
         GROUP BY year
         ORDER BY year
     """).fetchall()
@@ -84,7 +94,8 @@ def power_curve_by_year(conn: sqlite3.Connection) -> None:
 def best_efforts_by_year(conn: sqlite3.Connection) -> None:
     """
     Top-3 activities for each standard duration, per year.
-    Useful for spotting personal bests and seasonal peaks.
+    Only activities with power_trusted = 1 are included.
+    Activities before 2018-06-25 are excluded (inaccurate power meter period).
     """
     out = []
     for col in _MMP_COLS:
@@ -105,6 +116,7 @@ def best_efforts_by_year(conn: sqlite3.Connection) -> None:
             WHERE pb.{col} IS NOT NULL
               AND am.start_time IS NOT NULL
               AND ap.power_quality_score >= 50
+              AND ap.power_trusted = 1
             ORDER BY year, pb.{col} DESC
         """).fetchall()
 
@@ -208,13 +220,15 @@ def power_data_quality(conn: sqlite3.Connection) -> None:
 
 def candidate_ftp_history(conn: sqlite3.Connection) -> None:
     """
-    Chronological FTP estimates from all activities where one can be computed.
-    Higher quality_score = more reliable estimate.
+    Chronological FTP estimates from activities with trusted power data.
+    Activities before 2018-06-25 are excluded (inaccurate power meter period).
 
     Methodology:
       - If best_60min exists → FTP candidate = best_60min W
       - If best_20min exists → FTP candidate = best_20min × 0.95
-    Only activities with quality_score >= 60 are included.
+    Only activities with quality_score >= 60 AND power_trusted = 1 are included.
+
+    Output: candidate_ftp_history_filtered.csv
     """
     rows = conn.execute("""
         SELECT
@@ -232,6 +246,7 @@ def candidate_ftp_history(conn: sqlite3.Connection) -> None:
         JOIN power_bests pb         ON pb.activity_id = ap.activity_id
         WHERE ap.ftp_candidate_w IS NOT NULL
           AND ap.power_quality_score >= 60
+          AND ap.power_trusted = 1
           AND am.start_time IS NOT NULL
           AND am.duration_s >= 1200        -- at least 20 min required
         ORDER BY am.start_time
@@ -253,7 +268,7 @@ def candidate_ftp_history(conn: sqlite3.Connection) -> None:
 
     fields = ["date", "sport", "duration_min", "ftp_candidate_w", "ftp_basis",
               "best_20min_w", "best_60min_w", "normalised_power_w", "quality_score"]
-    _write_csv("candidate_ftp_history.csv", out, fields)
+    _write_csv("candidate_ftp_history_filtered.csv", out, fields)
 
 
 # ── Summary to console ────────────────────────────────────────────────────
@@ -277,18 +292,40 @@ def print_summary(conn: sqlite3.Connection) -> None:
     stream_rows = conn.execute("SELECT COUNT(*) FROM activity_streams").fetchone()[0]
     print(f"  Stream records     : {stream_rows:,}")
 
-    # FTP history
+    # ── Power validation summary ───────────────────────────────────────────
+    print()
+    print("=== Power data validation ===")
+    trust_counts = conn.execute("""
+        SELECT
+            power_trusted,
+            COUNT(*) AS cnt
+        FROM activity_performance
+        WHERE has_power_stream = 1
+        GROUP BY power_trusted
+    """).fetchall()
+    trusted_n   = next((r["cnt"] for r in trust_counts if r["power_trusted"] == 1), 0)
+    untrusted_n = next((r["cnt"] for r in trust_counts if r["power_trusted"] == 0), 0)
+    print(f"  Trusted power activities   : {trusted_n}  (from {_POWER_TRUST_CUTOFF} onward)")
+    print(f"  Untrusted power activities : {untrusted_n}  (before {_POWER_TRUST_CUTOFF})")
+    print(f"  NOTE: Power data before {_POWER_TRUST_CUTOFF} excluded due to known")
+    print(f"        inaccurate power meter period. HR and ride data remain valid.")
+
+    # FTP history (trusted only)
     ftp_rows = conn.execute("""
         SELECT COUNT(*) FROM activity_performance
-        WHERE ftp_candidate_w IS NOT NULL AND power_quality_score >= 60
+        WHERE ftp_candidate_w IS NOT NULL
+          AND power_quality_score >= 60
+          AND power_trusted = 1
     """).fetchone()[0]
-    print(f"  FTP candidates     : {ftp_rows}")
+    print(f"  Trusted FTP candidates     : {ftp_rows}")
 
-    # Best ever
+    # Best ever from trusted activities only
     best = conn.execute("""
         SELECT am.start_time, pb.best_20min, pb.best_60min
         FROM power_bests pb
-        JOIN activity_metadata am ON am.id = pb.activity_id
+        JOIN activity_metadata am         ON am.id = pb.activity_id
+        JOIN activity_performance ap      ON ap.activity_id = pb.activity_id
+        WHERE ap.power_trusted = 1
         ORDER BY COALESCE(pb.best_60min, pb.best_20min * 0.95) DESC NULLS LAST
         LIMIT 1
     """).fetchone()
@@ -296,7 +333,7 @@ def print_summary(conn: sqlite3.Connection) -> None:
         b60  = f"60-min best: {best['best_60min']}W"  if best["best_60min"] else ""
         b20  = f"20-min best: {best['best_20min']}W"  if best["best_20min"] else ""
         date = (best["start_time"] or "")[:10]
-        print(f"  Highest effort     : {date}  {b60 or b20}")
+        print(f"  Highest trusted effort     : {date}  {b60 or b20}")
 
     print()
 
@@ -311,6 +348,8 @@ def run() -> None:
     conn = _open_db()
 
     print("Generating Phase 2 reports…")
+    print(f"  Power trust cutoff : {_POWER_TRUST_CUTOFF} (inaccurate meter before this date)")
+    print()
     power_curve_by_year(conn)
     best_efforts_by_year(conn)
     aerobic_efficiency_by_year(conn)
