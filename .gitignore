@@ -26,3 +26,9 @@ Thumbs.db
 
 # Docker
 *.log
+
+# Garmin raw data — do not commit
+data/garmin_export/
+data/garmin_device/
+data/processed/
+data/reports/
