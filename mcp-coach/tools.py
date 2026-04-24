@@ -1,5 +1,5 @@
 """
-tools.py - Read-only tool functions for mcp-coach.
+tools.py — Read-only tool functions for mcp-coach.
 Each function fetches structured data from the shared club.db.
 These are the grounding layer — Groq never computes these values.
 """
@@ -11,6 +11,11 @@ def _conn(db_path: str) -> sqlite3.Connection:
     c = sqlite3.connect(db_path, check_same_thread=False)
     c.row_factory = sqlite3.Row
     return c
+
+
+def _monday_of_week(d: date) -> date:
+    """Return the Monday of the week containing d."""
+    return d - timedelta(days=d.weekday())
 
 
 def get_today_coaching_brief(db_path: str, user_id: int) -> dict:
@@ -52,7 +57,7 @@ def get_recent_rides(db_path: str, user_id: int, days: int = 14) -> list:
                   tss, avg_watts, np_watts, elevation_m
            FROM activity_log
            WHERE user_id=? AND date>=?
-           ORDER BY date DESC LIMIT 14""",
+           ORDER BY date DESC LIMIT 20""",
         (user_id, cutoff),
     ).fetchall()
     c.close()
@@ -65,7 +70,7 @@ def get_last_ride(db_path: str, user_id: int) -> dict:
 
 
 def get_today_rides(db_path: str, user_id: int) -> list:
-    """Return all rides logged for today (date = today's ISO date)."""
+    """Return all rides logged for today."""
     today = date.today().isoformat()
     c = _conn(db_path)
     rows = c.execute(
@@ -78,6 +83,43 @@ def get_today_rides(db_path: str, user_id: int) -> list:
     ).fetchall()
     c.close()
     return [dict(r) for r in rows]
+
+
+def get_previous_week_rides(db_path: str, user_id: int) -> list:
+    """Return all rides from the previous calendar week (Mon–Sun)."""
+    today   = date.today()
+    this_monday = _monday_of_week(today)
+    prev_monday = this_monday - timedelta(days=7)
+    prev_sunday = this_monday - timedelta(days=1)
+    c = _conn(db_path)
+    rows = c.execute(
+        """SELECT date, name, moving_time_s, distance_m,
+                  tss, avg_watts, np_watts, elevation_m
+           FROM activity_log
+           WHERE user_id=? AND date>=? AND date<=?
+           ORDER BY date ASC""",
+        (user_id, prev_monday.isoformat(), prev_sunday.isoformat()),
+    ).fetchall()
+    c.close()
+    return [dict(r) for r in rows]
+
+
+def get_previous_week_summary(db_path: str, user_id: int) -> dict:
+    """Aggregate stats for the previous calendar week."""
+    rides = get_previous_week_rides(db_path, user_id)
+    if not rides:
+        return {"rides": 0, "hours": 0.0, "tss": 0.0, "distance_km": 0.0, "elevation_m": 0.0}
+    total_tss   = sum(float(r["tss"] or 0)               for r in rides)
+    total_secs  = sum(float(r["moving_time_s"] or 0)      for r in rides)
+    total_dist  = sum(float(r["distance_m"] or 0)         for r in rides)
+    total_elev  = sum(float(r["elevation_m"] or 0)        for r in rides)
+    return {
+        "rides":       len(rides),
+        "hours":       round(total_secs / 3600, 1),
+        "tss":         round(total_tss, 0),
+        "distance_km": round(total_dist / 1000, 1),
+        "elevation_m": round(total_elev, 0),
+    }
 
 
 def get_week_summary(db_path: str, user_id: int) -> dict:
@@ -115,7 +157,7 @@ def get_training_goal(db_path: str, user_id: int) -> dict:
         "weekly_tss_target":   r.get("weekly_tss_target", 0),
         "target_event_date":   r.get("target_event_date", ""),
         "target_event_name":   r.get("target_event_name", ""),
-        "long_ride_day":       r.get("preferred_days", ""),  # column is preferred_days
+        "long_ride_day":       r.get("preferred_days", ""),
     }
 
 

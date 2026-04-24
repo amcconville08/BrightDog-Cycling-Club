@@ -22,7 +22,7 @@ log = logging.getLogger("mcp-coach")
 
 DB_PATH = os.environ.get("DB_PATH", "/data/club.db")
 
-app = FastAPI(title="mcp-coach", version="1.0", docs_url="/docs")
+app = FastAPI(title="mcp-coach", version="2.0", docs_url="/docs")
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,7 +33,7 @@ app.add_middleware(
 
 
 # ---------------------------------------------------------------------------
-# /ask — main endpoint called by the cycling-club app
+# /ask — main endpoint
 # ---------------------------------------------------------------------------
 
 class AskRequest(BaseModel):
@@ -47,13 +47,11 @@ def ask(req: AskRequest):
     if not req.question.strip():
         raise HTTPException(status_code=400, detail="question is required")
     try:
-        ctx    = prompts.build_context(DB_PATH, req.user_id)
-        system = prompts.build_system_prompt(ctx)
-        # Question is enriched with the full context packet so Groq always
-        # has ground-truth data regardless of what the user asked
-        has_history = bool(req.history)
+        ctx          = prompts.build_context(DB_PATH, req.user_id)
+        system       = prompts.build_system_prompt(ctx)
+        has_history  = bool(req.history)
         full_question = prompts.build_user_message(ctx, req.question, has_history=has_history)
-        answer = groq_client.ask(system, full_question, history=req.history)
+        answer       = groq_client.ask(system, full_question, history=req.history)
         if answer:
             source = "groq"
         else:
@@ -61,12 +59,65 @@ def ask(req: AskRequest):
             source = "fallback"
         return {"answer": answer, "source": source}
     except Exception as exc:
-        log.error("ask failed for user %s: %s", req.user_id, exc)
+        log.error("ask failed for user %s: %s", req.user_id, exc, exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ---------------------------------------------------------------------------
-# /context — full structured context (useful for debugging)
+# /weekly-review — Monday review + intent card
+# ---------------------------------------------------------------------------
+
+class WeeklyReviewRequest(BaseModel):
+    user_id: int
+
+
+@app.post("/weekly-review")
+def weekly_review(req: WeeklyReviewRequest):
+    """
+    Generate the Monday weekly review + intent card.
+    Reviews last week's training and sets intent for the coming week.
+    Can be called any day but is most meaningful on Monday mornings.
+    """
+    try:
+        ctx    = prompts.build_context(DB_PATH, req.user_id)
+        system = prompts.build_system_prompt(ctx)
+        prompt = prompts.build_weekly_review_prompt(ctx)
+        # Weekly review is slightly longer — allow up to 350 tokens
+        answer = groq_client.ask(system, prompt, max_tokens=350)
+        if answer:
+            source = "groq"
+        else:
+            # Deterministic fallback: structured plain-text summary
+            cp = ctx["context_packet"]
+            pw = cp.get("previous_week", {})
+            ps = pw.get("summary", {})
+            wo = cp.get("weekly_outlook") or {}
+            parts = []
+            if ps.get("rides"):
+                parts.append(
+                    f"Last week: {ps['rides']} rides, {ps['hours']}h, "
+                    f"TSS {ps['tss']:.0f}."
+                )
+            else:
+                parts.append("Last week: no rides recorded.")
+            if wo.get("focus"):
+                parts.append(f"This week: {wo['focus']}.")
+                if wo.get("coaching_note"):
+                    parts.append(f"Coach note: {wo['coaching_note']}")
+            answer = " ".join(parts)
+            source = "fallback"
+        return {
+            "answer":      answer,
+            "source":      source,
+            "review_date": ctx["context_packet"]["date"],
+        }
+    except Exception as exc:
+        log.error("weekly-review failed for user %s: %s", req.user_id, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ---------------------------------------------------------------------------
+# /context — full structured context (debug)
 # ---------------------------------------------------------------------------
 
 @app.get("/context/{user_id}")
@@ -92,6 +143,13 @@ def tool_last_ride(user_id: int):
 @app.get("/tools/recent-rides/{user_id}")
 def tool_recent_rides(user_id: int, days: int = 14):
     return tools.get_recent_rides(DB_PATH, user_id, days)
+
+@app.get("/tools/previous-week/{user_id}")
+def tool_previous_week(user_id: int):
+    return {
+        "rides":   tools.get_previous_week_rides(DB_PATH, user_id),
+        "summary": tools.get_previous_week_summary(DB_PATH, user_id),
+    }
 
 @app.get("/tools/week/{user_id}")
 def tool_week(user_id: int):
@@ -122,6 +180,11 @@ def tool_coaching_brief(user_id: int):
 def resource_glossary():
     return resources.GLOSSARY
 
+@app.get("/resources/athlete-context")
+def resource_athlete_context():
+    """Athlete identity, history peaks, and coaching philosophy."""
+    return resources.ATHLETE_CONTEXT
+
 
 # ---------------------------------------------------------------------------
 # Health
@@ -129,7 +192,6 @@ def resource_glossary():
 
 @app.get("/healthz")
 def health():
-    # Verify DB is reachable
     try:
         import sqlite3
         c = sqlite3.connect(DB_PATH)
