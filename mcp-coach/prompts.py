@@ -1,15 +1,16 @@
 """
-prompts.py — Context assembly and prompt architecture for mcp-coach.
+prompts.py — Context assembly and prompt architecture for mcp-coach v2.
 
 Architecture:
   1. tools.py fetches raw data from club.db (source of truth)
-  2. build_context() assembles and interprets everything into a structured packet
-  3. _build_narrative_brief() converts the packet into a human-readable coaching brief
-  4. build_system_prompt() injects athlete identity into the coach persona
-  5. build_user_message() sends the brief + question to Groq
+  2. analysis.py interprets the data into coaching-specific language
+  3. build_context() assembles everything into a structured packet
+  4. _build_narrative_brief() converts the packet into a minimum coaching brief
+  5. build_system_prompt() injects athlete identity and coaching framework
+  6. build_user_message() sends the brief + question to Groq
 
 Groq's job: translate the pre-interpreted brief into natural coaching language.
-Groq must NOT invent advice, compute metrics, or override the athlete-specific context.
+Groq must NOT invent advice, compute metrics, or override athlete-specific context.
 """
 from __future__ import annotations
 from datetime import date, timedelta
@@ -21,73 +22,7 @@ from tools import (
     estimate_ftp_candidate, get_athlete_profile, get_weekly_outlook,
 )
 from resources import ATHLETE_CONTEXT
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _ride_summary(r: dict) -> str:
-    """One-line readable ride summary."""
-    mins = int(float(r.get("moving_time_s") or 0) / 60)
-    tss  = float(r.get("tss") or 0)
-    np   = r.get("np_watts")
-    elev = r.get("elevation_m")
-    parts = [f"{r['name']}", f"{mins}min", f"TSS {tss:.0f}"]
-    if np and float(np) > 0:
-        parts.append(f"NP {float(np):.0f}W")
-    if elev and float(elev) > 50:
-        parts.append(f"+{float(elev):.0f}m")
-    return ", ".join(parts)
-
-
-def _interpret_ctl(ctl: float) -> str:
-    """Map CTL to athlete-specific context from reference points."""
-    for ref in ATHLETE_CONTEXT["ctl_reference"]:
-        lo, hi = ref["ctl_range"]
-        if lo <= ctl <= hi:
-            return ref["context"]
-    if ctl > 65:
-        return "very high fitness load — above historical peaks"
-    return "early base — well below race-fit level"
-
-
-def _interpret_load(ctl: float, atl: float, tsb: float) -> str:
-    """
-    Produce a plain-language load interpretation grounded in athlete context.
-    Avoids raw metric recitation — gives meaning instead.
-    """
-    if tsb > 10:
-        return "Fresh legs — positive TSB, good time for quality or a harder effort."
-    if tsb > 0:
-        return "Slightly fresh — small positive TSB, solid day for a quality session."
-    if tsb >= -15:
-        return "Light fatigue carry — normal mid-week territory, threshold work is productive here."
-    if tsb >= -30:
-        ratio = atl / ctl if ctl > 0 else 1
-        if ratio < 1.4:
-            return "Meaningful fatigue accumulated — typical for an active build block. Hard sessions are still appropriate today."
-        return "Deep in a load block — fatigue is real but expected. One more hard session is fine; don't stack a third consecutive hard day."
-    if tsb >= -45:
-        return "Heavy fatigue carrying over — best to be honest about what the body can deliver today. A reduced session still has value."
-    return "Significant accumulated load — recovery priority. Forcing a hard session here risks a flat or injurious week."
-
-
-def _ftp_vs_history(current_ftp: float) -> str:
-    """Contextualise current FTP against athlete's verified historical peaks."""
-    peaks = ATHLETE_CONTEXT["historical_ftp"]["peaks"]
-    best  = max(p["ftp_w"] for p in peaks)
-    target_lo, target_hi = ATHLETE_CONTEXT["historical_ftp"]["current_target_w"]
-    pct = round(current_ftp / best * 100)
-    if current_ftp >= 270:
-        return f"{current_ftp:.0f}W — within historical peak range ({best}W best). Strong form."
-    if current_ftp >= target_hi:
-        return f"{current_ftp:.0f}W — above current comeback target ({target_lo}–{target_hi}W). Progression on track."
-    if current_ftp >= target_lo:
-        return f"{current_ftp:.0f}W — within comeback target range ({target_lo}–{target_hi}W). Tracking well."
-    gap = target_lo - current_ftp
-    return (
-        f"{current_ftp:.0f}W — {gap:.0f}W below comeback target ({target_lo}–{target_hi}W). "
-        f"Currently at {pct}% of historical best ({best}W)."
-    )
+import analysis
 
 
 # ── Context assembly ──────────────────────────────────────────────────────────
@@ -95,19 +30,19 @@ def _ftp_vs_history(current_ftp: float) -> str:
 def build_context(db_path: str, user_id: int) -> dict:
     """
     Assemble the full grounded context packet.
-    All numbers come from the DB — Groq only ever sees this output.
+    All numbers come from the DB — analysis.py does the interpretation.
     """
-    readiness      = get_readiness_summary(db_path, user_id)
-    today_rides    = get_today_rides(db_path, user_id)
-    recent_rides   = get_recent_rides(db_path, user_id, days=14)
+    readiness       = get_readiness_summary(db_path, user_id)
+    today_rides     = get_today_rides(db_path, user_id)
+    recent_rides    = get_recent_rides(db_path, user_id, days=14)
     prev_week_rides = get_previous_week_rides(db_path, user_id)
-    prev_week_sum  = get_previous_week_summary(db_path, user_id)
-    week           = get_week_summary(db_path, user_id)
-    goal           = get_training_goal(db_path, user_id)
-    zones          = get_current_zones(db_path, user_id)
-    profile        = get_athlete_profile(db_path, user_id)
-    ftp_est        = estimate_ftp_candidate(db_path, user_id)
-    weekly_outlook = get_weekly_outlook(db_path, user_id)
+    prev_week_sum   = get_previous_week_summary(db_path, user_id)
+    week            = get_week_summary(db_path, user_id)
+    goal            = get_training_goal(db_path, user_id)
+    zones           = get_current_zones(db_path, user_id)
+    profile         = get_athlete_profile(db_path, user_id)
+    ftp_est         = estimate_ftp_candidate(db_path, user_id)
+    weekly_outlook  = get_weekly_outlook(db_path, user_id)
 
     today_str  = date.today().isoformat()
     today_day  = date.today().strftime("%A")
@@ -121,10 +56,29 @@ def build_context(db_path: str, user_id: int) -> dict:
     ftp   = float(zones.get("ftp", 200))
     ratio = round(atl / ctl, 2) if ctl > 0 else 0
 
-    # Pre-interpreted strings
-    load_interp  = _interpret_load(ctl, atl, tsb)
-    ctl_interp   = _interpret_ctl(ctl)
-    ftp_interp   = _ftp_vs_history(ftp)
+    # Prev CTL from metrics_cache (added in v2)
+    prev_ctl = float(readiness.get("prev_ctl", 0))
+
+    # Week targets
+    tss_target   = float(goal.get("weekly_tss_target") or 0)
+    hours_target = float(goal.get("weekly_hours_target") or 0)
+    weekly_tss   = float(week.get("weekly_tss", 0))
+    weekly_hours = float(week.get("weekly_hours", 0))
+    week_tss_pct = round(weekly_tss / tss_target * 100) if tss_target else None
+    week_hrs_pct = round(weekly_hours / hours_target * 100) if hours_target else None
+
+    # Coaching intelligence (analysis layer)
+    season = analysis.get_season()
+    intelligence = analysis.build_coaching_intelligence(
+        ctl=ctl, atl=atl, tsb=tsb, prev_ctl=prev_ctl, ftp=ftp,
+        day_of_week=day_num,
+        weekly_tss=weekly_tss,
+        weekly_tss_target=tss_target,
+        weekly_rides=int(week.get("weekly_rides", 0)),
+        recent_rides=recent_rides,
+        today_rides=today_rides,
+        season=season,
+    )
 
     # Today's ride(s)
     if today_rides:
@@ -162,7 +116,7 @@ def build_context(db_path: str, user_id: int) -> dict:
         for r in recent_rides if r["date"] != today_str
     ][:10]
 
-    # Previous week rides (for review)
+    # Previous week rides
     prev_week = [
         {
             "date":  r["date"],
@@ -175,22 +129,17 @@ def build_context(db_path: str, user_id: int) -> dict:
         for r in prev_week_rides
     ]
 
-    # Week targets
-    tss_target   = float(goal.get("weekly_tss_target") or 0)
-    hours_target = float(goal.get("weekly_hours_target") or 0)
-    week_tss_pct = round(float(week.get("weekly_tss", 0)) / tss_target * 100) if tss_target else None
-    week_hrs_pct = round(float(week.get("weekly_hours", 0)) / hours_target * 100) if hours_target else None
-
     context_packet = {
         "date":     today_str,
         "day":      today_day,
         "is_monday": is_monday,
         "days_remaining_this_week": days_left,
+        "season":   season,
 
         "athlete": {
             "name":          profile.get("name", "Athlete"),
             "ftp":           ftp,
-            "ftp_context":   ftp_interp,
+            "ftp_context":   intelligence["ftp_context"],
             "goal":          goal.get("goal") or goal.get("goal_custom") or "Not set",
             "target_event":  f"{goal.get('target_event_name','')} {goal.get('target_event_date','')}".strip() or None,
             "long_ride_day": goal.get("long_ride_day") or None,
@@ -200,12 +149,17 @@ def build_context(db_path: str, user_id: int) -> dict:
             "CTL":              round(ctl, 1),
             "ATL":              round(atl, 1),
             "TSB":              round(tsb, 1),
+            "prev_CTL":         round(prev_ctl, 1),
             "ratio_ATL_CTL":    ratio,
             "classification":   readiness.get("classification"),
             "readiness_score":  readiness.get("readiness"),
-            "ctl_context":      ctl_interp,
-            "load_interpretation": load_interp,
+            "ctl_context":      intelligence["ctl_context"],
+            "race_fitness":     intelligence["race_fitness"],
+            "ctl_trend":        intelligence["ctl_trend"],
+            "load_state":       intelligence["load_state"],
         },
+
+        "coaching_intelligence": intelligence,
 
         "today_ride": today_ctx,
 
@@ -218,8 +172,8 @@ def build_context(db_path: str, user_id: int) -> dict:
 
         "week_so_far": {
             "rides":        week.get("weekly_rides", 0),
-            "hours":        week.get("weekly_hours", 0),
-            "tss":          round(float(week.get("weekly_tss", 0)), 0),
+            "hours":        weekly_hours,
+            "tss":          round(weekly_tss, 0),
             "distance_km":  week.get("weekly_distance_km"),
             "tss_target":   tss_target or None,
             "hours_target": hours_target or None,
@@ -254,8 +208,9 @@ def build_context(db_path: str, user_id: int) -> dict:
 
 def _build_narrative_brief(cp: dict) -> str:
     """
-    Convert the structured context packet into a human-readable coaching brief.
-    This is what Groq reads — pre-interpreted, athlete-specific, no raw JSON.
+    Minimum context object — what Groq reads.
+    Pre-interpreted, athlete-specific, no raw metrics dumped.
+    Every line is a coaching signal, not a data readout.
     """
     lines = []
 
@@ -267,10 +222,14 @@ def _build_narrative_brief(cp: dict) -> str:
     sug  = cp.get("pre_ride_suggestion") or {}
     tod  = cp["today_ride"]
     rec  = cp.get("recent_rides") or []
+    intel = cp.get("coaching_intelligence") or {}
 
-    # ── Date and athlete ──────────────────────────────────────────────────────
+    # ── Date, athlete, season ─────────────────────────────────────────────────
     lines.append(f"TODAY: {cp['day']} {cp['date']}")
-    lines.append(f"ATHLETE: {ath['name']} | FTP {ath['ftp_context']}")
+    lines.append(f"ATHLETE: {ath['name']}")
+    lines.append(f"FTP: {ath['ftp_context']}")
+    if intel.get("season_context"):
+        lines.append(f"SEASON: {intel['season_context']}")
     goal_str = ath.get("goal") or ""
     if goal_str and goal_str != "Not set":
         lines.append(f"GOAL: {goal_str}")
@@ -278,12 +237,21 @@ def _build_narrative_brief(cp: dict) -> str:
         lines.append(f"TARGET EVENT: {ath['target_event']}")
     lines.append("")
 
-    # ── Training state ────────────────────────────────────────────────────────
+    # ── Training state (interpreted, not raw) ─────────────────────────────────
     lines.append("TRAINING STATE:")
-    lines.append(f"  Fitness base (CTL {ts['CTL']:.0f}): {ts['ctl_context']}")
-    lines.append(f"  Load & form: {ts['load_interpretation']}")
-    lines.append(f"  Readiness: {ts.get('readiness_score', '—')}/100")
+    lines.append(f"  Fitness: {ts['ctl_context']} (CTL {ts['CTL']:.0f})")
+    if ts.get("ctl_trend"):
+        lines.append(f"  Trend: {ts['ctl_trend']}")
+    lines.append(f"  Form: {ts['load_state']}")
+    if ts.get("race_fitness"):
+        lines.append(f"  Race fitness: {ts['race_fitness']}")
     lines.append("")
+
+    # ── Priority of the week ──────────────────────────────────────────────────
+    if intel.get("priority_of_week"):
+        lines.append(f"PRIORITY THIS WEEK:")
+        lines.append(f"  {intel['priority_of_week']}")
+        lines.append("")
 
     # ── Today's ride ──────────────────────────────────────────────────────────
     if tod.get("completed"):
@@ -295,6 +263,8 @@ def _build_narrative_brief(cp: dict) -> str:
             if r.get("elevation_m") and r["elevation_m"] > 50:
                 parts.append(f"+{r['elevation_m']:.0f}m")
             lines.append(f"  - {', '.join(parts)}")
+        if intel.get("last_ride_assessment"):
+            lines.append(f"  Assessment: {intel['last_ride_assessment']}")
     else:
         lines.append("TODAY'S RIDING: None yet.")
         if sug.get("style"):
@@ -320,16 +290,21 @@ def _build_narrative_brief(cp: dict) -> str:
             lines.append(f"  {', '.join(parts)}")
         lines.append("")
 
+    # ── Last ride assessment (if no today ride) ───────────────────────────────
+    if not tod.get("completed") and intel.get("last_ride_assessment") and rec:
+        lines.append(f"LAST RIDE: {intel['last_ride_assessment']}")
+        lines.append("")
+
     # ── This week so far ──────────────────────────────────────────────────────
     week_line = (
-        f"THIS WEEK SO FAR: {wk['rides']} rides, "
+        f"THIS WEEK: {wk['rides']} rides, "
         f"{wk['hours']}h, TSS {wk['tss']:.0f}"
     )
     if wk.get("tss_target"):
         pct = wk.get("tss_pct") or 0
-        week_line += f" ({pct}% of {wk['tss_target']:.0f} TSS target)"
+        week_line += f" ({pct}% of {wk['tss_target']:.0f} target)"
     lines.append(week_line)
-    lines.append(f"Days remaining this week: {cp['days_remaining_this_week']}")
+    lines.append(f"Days remaining: {cp['days_remaining_this_week']}")
     lines.append("")
 
     # ── Previous week ─────────────────────────────────────────────────────────
@@ -352,12 +327,12 @@ def _build_narrative_brief(cp: dict) -> str:
         if wo.get("key_sessions"):
             lines.append(f"  Key sessions: {'; '.join(wo['key_sessions'])}")
         if wo.get("coaching_note"):
-            lines.append(f"  Coach note: {wo['coaching_note']}")
+            lines.append(f"  Note: {wo['coaching_note']}")
         lines.append("")
 
     # ── FTP estimate from recent rides ────────────────────────────────────────
     if cp.get("ftp_estimate_from_rides"):
-        lines.append(f"CURRENT FTP ESTIMATE (from recent rides): {cp['ftp_estimate_from_rides']}W")
+        lines.append(f"FTP ESTIMATE (from recent rides): {cp['ftp_estimate_from_rides']}W")
         lines.append("")
 
     return "\n".join(lines)
@@ -365,43 +340,52 @@ def _build_narrative_brief(cp: dict) -> str:
 
 def _build_previous_week_brief(cp: dict) -> str:
     """
-    Focused brief for the previous week — used in Monday weekly review generation.
+    Focused brief for the previous week — used in Monday weekly review.
     """
-    pw   = cp.get("previous_week", {})
-    ps   = pw.get("summary", {})
+    pw    = cp.get("previous_week", {})
+    ps    = pw.get("summary", {})
     rides = pw.get("rides", [])
-    ts   = cp["training_state"]
-    wo   = cp.get("weekly_outlook") or {}
+    ts    = cp["training_state"]
+    wo    = cp.get("weekly_outlook") or {}
+    intel = cp.get("coaching_intelligence") or {}
 
-    lines = ["PREVIOUS WEEK SUMMARY (for review):"]
+    lines = ["PREVIOUS WEEK:"]
     if ps.get("rides"):
         lines.append(
             f"  {ps['rides']} rides | {ps['hours']}h | "
             f"TSS {ps['tss']:.0f} | {ps['distance_km']}km"
         )
-        lines.append("  Sessions:")
         for r in rides:
             parts = [r["date"], r["name"], f"{r['mins']}min", f"TSS {r['tss']}"]
             if r.get("np"):
                 parts.append(f"NP {r['np']:.0f}W")
             if r.get("elev") and r["elev"] > 50:
                 parts.append(f"+{r['elev']:.0f}m")
-            lines.append(f"    - {', '.join(parts)}")
+            lines.append(f"  - {', '.join(parts)}")
     else:
         lines.append("  No rides recorded last week.")
     lines.append("")
 
-    lines.append(f"CURRENT TRAINING STATE (entering this week):")
+    lines.append("ENTERING THIS WEEK:")
     lines.append(f"  {ts['ctl_context']} (CTL {ts['CTL']:.0f})")
-    lines.append(f"  {ts['load_interpretation']}")
-    lines.append(f"  TSB: {ts['TSB']:+.0f}")
+    lines.append(f"  {ts['load_state']}")
+    if intel.get("race_fitness_interp"):
+        lines.append(f"  {intel['race_fitness_interp']}")
     lines.append("")
 
+    if intel.get("priority_of_week"):
+        lines.append(f"THIS WEEK'S PRIORITY:")
+        lines.append(f"  {intel['priority_of_week']}")
+        lines.append("")
+
     if wo.get("focus"):
-        lines.append(f"THIS WEEK INTENT: {wo['focus']}")
+        lines.append(f"WEEK INTENT: {wo['focus']}")
         if wo.get("key_sessions"):
             lines.append(f"  Key sessions: {'; '.join(wo['key_sessions'])}")
         lines.append("")
+
+    if intel.get("season_context"):
+        lines.append(f"SEASON: {intel['season_context']}")
 
     return "\n".join(lines)
 
@@ -410,13 +394,14 @@ def _build_previous_week_brief(cp: dict) -> str:
 
 def build_system_prompt(ctx: dict) -> str:
     """
-    Build the full system prompt with athlete identity injected.
-    The athlete-specific section is at the top so it anchors everything else.
+    Build the system prompt with full athlete identity, biography, and coaching framework.
+    This is the coach persona — grounded in this specific athlete's history.
     """
     ac    = ATHLETE_CONTEXT
     hist  = ac["historical_ftp"]
     style = ac["riding_style"]
     peaks = hist["peaks"]
+
     peak_lines = "\n".join(
         f"  • {p['date']}: ~{p['ftp_w']}W FTP ({p['detail']})"
         for p in peaks
@@ -424,84 +409,108 @@ def build_system_prompt(ctx: dict) -> str:
     target_lo, target_hi = hist["current_target_w"]
     range_lo,  range_hi  = hist["realistic_range_w"]
 
+    # Significant events from timeline (health events only)
+    timeline_health = [e for e in ac.get("timeline", []) if e["type"] == "health"]
+    timeline_lines = "\n".join(
+        f"  • {e['date']}: {e['note']}" for e in timeline_health
+    )
+
     return f"""\
-You are an experienced cycling coach working with {ac['name']} — an {ac['experience']}.
+You are an experienced cycling coach working with {ac['name']}.
+{ac['name']} is an experienced club rider — treat them as a peer who understands training.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-ATHLETE IDENTITY (anchor everything to this)
+ATHLETE BIOGRAPHY — anchor every response to this
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Verified historical FTP peaks (from 8+ years of power data):
+Verified FTP peaks (from 8+ years of power data):
 {peak_lines}
-Historical realistic FTP range when fully fit: {range_lo}–{range_hi}W
-Current comeback target: {target_lo}–{target_hi}W → build beyond
-Context: {hist['current_target_context']}
+Full-fitness range: {range_lo}–{range_hi}W | Comeback target: {target_lo}–{target_hi}W
+
+Peak form training pattern (12 weeks before 2019 peak):
+  {hist['peak_form_training_pattern']}
 
 Rider profile:
-• Engine type: {style['engine_type']}
-• Week anchor: {style['weekly_anchor']}
-• Training preference: {style['preferred_training']}
+  Engine type: {style['engine_type']}
+  Weekly anchor: {style['weekly_anchor']}
+  Race history: {style['race_history']}
+  Comeback pattern: {style['comeback_pattern']}
+
+Significant events that affect data interpretation:
+{timeline_lines}
 
 Coaching philosophy:
-• CTL is context, not the goal. Never frame higher CTL as the objective.
-• {ac['coaching_philosophy']['coach_role'].capitalize()}.
-• Rider has final say. Surface what the body is saying — don't override it.
-• {ac['coaching_philosophy']['priority'].capitalize()}.
+  • CTL is context, not the goal
+  • Coach's job: interpret the pattern. The athlete interprets their body.
+  • Quality adaptation over chasing load numbers
+  • After significant health interruptions, progressive loading > hitting targets
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 COACHING VOICE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-• Concise. Confident. Calm. Direct. Human.
+• Concise. Confident. Direct. Specific. Human.
 • Sound like an experienced coach talking to a rider who knows their sport.
-• No waffle, no hedging, no padding.
-• Single questions: 2–4 sentences. No exceptions.
-• Weekly plans: one short purposeful line per day.
+• No waffle. No hedging. No therapy-bot softening.
+• Single questions: 3–5 sentences. No exceptions.
+• Use the pre-interpreted brief — do not recalculate or second-guess it.
 • Follow-up questions: answer only the new thing. Never re-summarise prior turns.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 HOW TO ANSWER BY QUESTION TYPE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 "How was today's / yesterday's ride?"
-→ Interpret the session: what training stimulus it delivered, whether it was
-  productive or destructive fatigue, and what it means for the next session.
-  Reference the athlete's goals and history. 2–3 sentences.
+→ Name the session. Interpret what training stimulus it delivered.
+  Was it productive or destructive fatigue? What does it mean for the next session?
+  3 sentences. Specific. Reference the athlete's goals or history when relevant.
 
-"What should I do today?" / "What should I do tomorrow?"
-→ Give a direct recommendation using the pre_ride_suggestion, load interpretation,
-  and weekly intent. Name the priority anchor (chain gang, long ride) if relevant.
-  End with a brief reflection prompt — not a command: "How do the legs actually feel?"
+"What should I do today?" / "What should I do this session?"
+→ State the PRIORITY OF THE WEEK from the brief first.
+  Then give a direct recommendation aligned to it.
+  Do NOT ask "how do the legs feel?" — that's the athlete's job to know.
+  End with what to protect (e.g. "keep tomorrow easy for chain gang").
 
 "How was last week?" / "What did last week look like?"
-→ Interpret the week's training pattern: what stimulus was achieved, where fatigue
-  accumulated, whether the week built toward the goal. 2–3 sentences. Specific.
+→ Interpret the week's training pattern: what stimulus was achieved,
+  where fatigue accumulated, whether the week built toward the goal.
+  3 sentences. Name the sessions. Be specific.
 
-"What should I do this week?" / "What's the plan this week?"
-→ Reference weekly_outlook if set. Name the 2–3 key sessions and their purpose.
-  Frame the recovery sessions explicitly as *part of the plan*, not fillers.
+"What should I do this week?" / "What's the plan?"
+→ Lead with the priority_of_week from the brief.
+  Name the 2–3 key sessions and their purpose explicitly.
+  Frame recovery sessions as part of the plan, not gaps.
   5–7 short lines max. No invented intervals or power targets.
 
 "How is my fitness / Am I getting fitter?"
-→ Compare current CTL and FTP estimate to historical context from the brief.
-  Talk trajectory, not raw numbers. 2 sentences.
+→ Compare current CTL and FTP to the historical peaks and comeback trajectory.
+  Talk trajectory, not raw numbers. Reference the comeback pattern if relevant.
+  2–3 sentences.
+
+"Am I ready for [event] / hill climb / race?"
+→ Use the race_fitness_interp and hill_climb_readiness from the brief.
+  Be direct: ready, approaching, or needs X more weeks. Name the gap.
 
 "What are my power zones?"
-→ State key zones from the context. Threshold (Z4) and endurance (Z2) most useful.
+→ State Z2 (endurance) and Z4 (threshold) from the context.
+  Those two are most actionable.
 
 "Weekly review" / "Monday review"
 → Use the WEEKLY REVIEW FORMAT below.
 
-Any other question → answer directly in 2–4 sentences.
+Any other question → answer directly in 3–5 sentences.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-WEEKLY REVIEW FORMAT (use only when asked for a review or Monday card)
+WEEKLY REVIEW FORMAT (use only for Monday card or explicit review requests)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 Last week:
-[2–3 sentences: what happened, what stimulus was built, where fatigue came from]
+[2–3 sentences: what happened, what stimulus was built, where fatigue came from.
+ Name the sessions. Specific TSS or duration if relevant.]
 
 This week:
-[2–3 sentences: what matters most, which sessions are priority, where to protect recovery]
+[2–3 sentences: what matters most, which sessions are priority, where to protect recovery.
+ Reference chain gang Tuesday explicitly. Reference long ride if relevant.]
 
 Coach note:
-[1–2 sentences of specific human insight — not generic. Name the sessions. Name the stakes.]
+[1–2 sentences of specific human insight — not generic. Reference this athlete's
+ history, comeback, or pattern where relevant. Not therapy; coaching.]
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 HARD RULES
@@ -509,28 +518,30 @@ HARD RULES
 1. Never invent sessions, intervals, durations, or power targets.
    Only reference what exists in the coaching brief.
 
-2. Never recite raw metrics. Use the pre-interpreted language from the brief.
-   ✗ "Your CTL is 52, ATL is 61, TSB is −9."
-   ✓ "You're carrying light mid-week fatigue — productive territory."
+2. Never recite raw metrics.
+   ✗ "Your CTL is 61, ATL is 70, TSB is −9."
+   ✓ Use the pre-interpreted load_state, ctl_context, priority_of_week.
 
-3. Never use:
-   • "it's essential" / "it's crucial" / "it's important to"
-   • "listen to your body" / "allow your body to absorb"
-   • "managing your fatigue" / "adequate recovery"
-   • "you might want to consider" / "balance hard sessions"
-   • "solid block" / "decent block" / "good mix of intensity and volume"
-   • "towards your goal" → always name it: "for FTP gains", "for the chain gang"
+3. BANNED phrases — never use:
+   • "listen to your body" / "how do the legs feel"
+   • "allow your body to absorb" / "adequate recovery"
+   • "it's crucial" / "it's important to" / "it's essential"
+   • "solid block" / "decent block" / "good mix of intensity"
+   • "you might want to consider" / "managing your fatigue"
+   • "towards your goal" → name it specifically
+   • "balance hard sessions" / "don't overdo it"
 
 4. Use cycling coaching language:
    load block / fatigue absorption / threshold stimulus / aerobic durability
-   intensity session / aerobic base / diesel engine / quality session / easy spin
+   chain gang / quality session / easy spin / diesel engine / aerobic base
 
 5. Self-check before sending:
-   □ Under 4 sentences for a single question?
-   □ No banned phrases?
-   □ No invented sessions or targets?
    □ Does it answer what was actually asked?
-   □ Does it sound like a real coach, or a chatbot?
+   □ Under 5 sentences for a single question?
+   □ No banned phrases?
+   □ No invented sessions?
+   □ Does it sound like a real coach, or a therapy bot?
+   □ Did I reference the priority_of_week if session advice was asked?
 """
 
 
@@ -538,33 +549,32 @@ HARD RULES
 
 def build_user_message(ctx: dict, question: str, has_history: bool = False) -> str:
     """
-    Build the full user message: pre-interpreted narrative brief + question.
-    Replaces raw JSON with a human-readable coaching brief so Groq focuses on
-    language quality rather than data interpretation.
+    Build the user message: minimum coaching brief + question.
     """
-    cp   = ctx["context_packet"]
-    name = cp["athlete"]["name"].split()[0]
+    cp    = ctx["context_packet"]
+    name  = cp["athlete"]["name"].split()[0]
     brief = _build_narrative_brief(cp)
 
     prefix = ""
     if has_history:
         prefix = (
-            "Follow-up — answer the new question only in 2–4 sentences. "
-            "Do not re-introduce the athlete or repeat context already discussed.\n\n"
+            "Follow-up — answer the new question only in 3–5 sentences. "
+            "Do not re-introduce context already discussed.\n\n"
         )
 
     suggestion = cp.get("pre_ride_suggestion") or {}
+    intel = cp.get("coaching_intelligence") or {}
     if not suggestion.get("style") and not cp["today_ride"].get("completed"):
         prefix += (
-            "NOTE: No pre-computed ride suggestion is set. "
-            "Use the load interpretation and weekly intent to answer directly.\n\n"
+            "NOTE: No pre-computed ride suggestion. "
+            "Use priority_of_week and load_state to answer directly.\n\n"
         )
 
     banned = (
-        "BANNED — never use: 'solid block', 'decent block', 'good mix of intensity', "
-        "'it's crucial', 'listen to your body', 'allow your body to absorb', "
-        "'adequate recovery', 'you might want to consider', 'towards your goal'. "
-        "Never recite CTL/ATL/TSB as raw numbers. Use the pre-interpreted language above.\n\n"
+        "BANNED: 'solid block', 'decent block', 'good mix', 'listen to your body', "
+        "'how do the legs feel', 'it's crucial', 'allow your body to absorb', "
+        "'adequate recovery', 'you might want to consider', 'towards your goal', "
+        "'balance hard sessions'. Never recite CTL/ATL/TSB as raw numbers.\n\n"
     )
 
     return (
@@ -573,25 +583,37 @@ def build_user_message(ctx: dict, question: str, has_history: bool = False) -> s
         f"{brief}\n"
         f"=== END BRIEF ===\n\n"
         f"{banned}"
-        f"Address {name} as 'you'. Question: {question}"
+        f"Address {name} as 'you'. Answer in 3–5 sentences maximum. "
+        f"Question: {question}"
     )
 
 
 def build_weekly_review_prompt(ctx: dict) -> str:
     """
-    Build the prompt for Monday's weekly review + intent card.
-    Uses previous week data and current training state.
+    Build the Monday weekly review + intent card prompt.
     """
     cp    = ctx["context_packet"]
     name  = cp["athlete"]["name"].split()[0]
     brief = _build_previous_week_brief(cp)
 
+    banned = (
+        "BANNED — never use in the review: 'it's crucial', 'it's important to', "
+        "'listen to your body', 'allow your body to absorb', 'adequate recovery', "
+        "'solid block', 'decent block', 'good mix of intensity', "
+        "'you might want to consider', 'manage your fatigue', 'balance hard sessions', "
+        "'we need to', 'we should'. "
+        "Address the athlete as 'you', never 'we'. "
+        "Never recite CTL/ATL/TSB as raw numbers.\n\n"
+    )
+
     return (
         f"=== WEEKLY REVIEW BRIEF ===\n"
         f"{brief}\n"
         f"=== END BRIEF ===\n\n"
-        f"Generate a weekly review and intent card for {name} using the "
-        f"WEEKLY REVIEW FORMAT from your instructions. "
-        f"Be specific about sessions — name them. "
-        f"The coach note must be concrete, not generic."
+        f"{banned}"
+        f"Generate the weekly review and intent card for {name} using the "
+        f"WEEKLY REVIEW FORMAT. Address {name} as 'you' throughout. "
+        f"Be specific — name the sessions, reference chain gang Tuesday, "
+        f"reference the priority_of_week. "
+        f"The coach note must reference this athlete's comeback or history concretely."
     )

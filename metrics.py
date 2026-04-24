@@ -4,7 +4,7 @@ No I/O, no side effects. All functions take plain Python data and return plain P
 EWMA-based CTL/ATL/TSB following the Banister impulse-response model.
 """
 import math
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date as date_cls
 
 _CTL_DECAY = math.exp(-1 / 42)
 _ATL_DECAY = math.exp(-1 / 7)
@@ -62,9 +62,13 @@ def _parse_start_ts(activity: dict) -> float:
         return 0.0
 
 
-def compute_metrics(activities: list, ftp: float) -> dict:
+def compute_metrics(activities: list, ftp: float, ctl_seed: dict = None) -> dict:
     """
     Compute all fitness metrics from a list of raw Strava activity dicts.
+
+    If ctl_seed is provided (dict with keys 'ctl', 'atl', 'prev_ctl', 'seed_date'),
+    the EWMA starts from the seed values at seed_date and only processes Strava
+    activities AFTER seed_date (to avoid double-counting with Garmin history).
 
     Returns a dict with keys prefixed 'cycling_' matching the exporter schema.
     Only activities whose type is in CYCLING_TYPES are included.
@@ -86,49 +90,77 @@ def compute_metrics(activities: list, ftp: float) -> dict:
     rides.sort(key=lambda x: x[0])
 
     # ---------------------------------------------------------------------------
-    # Build a daily TSS series for EWMA
+    # Determine EWMA starting point
+    # ---------------------------------------------------------------------------
+    use_seed = False
+    seed_date = None
+    ctl = 0.0
+    atl = 0.0
+    prev_ctl_seed = 0.0
+
+    if ctl_seed and ctl_seed.get("seed_date") and float(ctl_seed.get("ctl", 0)) > 0:
+        try:
+            seed_date = date_cls.fromisoformat(str(ctl_seed["seed_date"]))
+            ctl = float(ctl_seed.get("ctl", 0))
+            atl = float(ctl_seed.get("atl", 0))
+            prev_ctl_seed = float(ctl_seed.get("prev_ctl", 0))
+            use_seed = True
+        except Exception:
+            use_seed = False
+
+    # ---------------------------------------------------------------------------
+    # Build a daily TSS series for EWMA — only include rides in scope
     # ---------------------------------------------------------------------------
     daily_tss_map: dict = {}
     for ts, act in rides:
         dt_utc = datetime.fromtimestamp(ts, tz=timezone.utc).date()
+        if use_seed and dt_utc <= seed_date:
+            # Garmin seed covers this period — skip to avoid double-counting
+            continue
         tss = estimate_tss(act, ftp)
         daily_tss_map[dt_utc] = daily_tss_map.get(dt_utc, 0.0) + tss
 
     # ---------------------------------------------------------------------------
-    # EWMA for CTL and ATL — also capture prev_ctl (CTL 7 days ago)
+    # EWMA for CTL and ATL
     # ---------------------------------------------------------------------------
-    ctl = 0.0
-    atl = 0.0
-    prev_ctl = 0.0
+    prev_ctl = prev_ctl_seed  # default to seed's prev_ctl value
     seven_days_ago = today_date - timedelta(days=7)
 
-    if daily_tss_map:
-        first_date = min(daily_tss_map.keys())
-        current = first_date
-        while current <= today_date:
-            tss_today = daily_tss_map.get(current, 0.0)
-            ctl = ctl * _CTL_DECAY + tss_today * (1 - _CTL_DECAY)
-            atl = atl * _ATL_DECAY + tss_today * (1 - _ATL_DECAY)
-            if current == seven_days_ago:
-                prev_ctl = ctl
-            current += timedelta(days=1)
+    if use_seed:
+        # Start EWMA from day after seed_date, using seeded CTL/ATL as initial values
+        ewma_start = seed_date + timedelta(days=1)
+    elif daily_tss_map:
+        ewma_start = min(daily_tss_map.keys())
+        ctl = 0.0
+        atl = 0.0
+    else:
+        ewma_start = today_date
+
+    current = ewma_start
+    while current <= today_date:
+        tss_today = daily_tss_map.get(current, 0.0)
+        ctl = ctl * _CTL_DECAY + tss_today * (1 - _CTL_DECAY)
+        atl = atl * _ATL_DECAY + tss_today * (1 - _ATL_DECAY)
+        if current == seven_days_ago:
+            prev_ctl = ctl
+        current += timedelta(days=1)
 
     tsb = ctl - atl
 
     # ---------------------------------------------------------------------------
-    # Today's TSS and kJ
+    # Today's TSS and kJ (from all rides, regardless of seed)
     # ---------------------------------------------------------------------------
-    daily_tss = daily_tss_map.get(today_date, 0.0)
-
+    daily_tss = 0.0
     daily_kj = 0.0
     for ts, act in rides:
         dt_utc = datetime.fromtimestamp(ts, tz=timezone.utc).date()
         if dt_utc == today_date:
+            daily_tss += estimate_tss(act, ftp)
             kj = act.get("kilojoules") or 0.0
             daily_kj += float(kj)
 
     # ---------------------------------------------------------------------------
-    # Last activity (most recent ride, regardless of date)
+    # Last activity (most recent ride, regardless of date or seed)
     # ---------------------------------------------------------------------------
     last_distance_m = 0.0
     last_moving_time_s = 0.0

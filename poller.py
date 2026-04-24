@@ -43,8 +43,16 @@ class Poller(threading.Thread):
                 )
                 activities = strava.fetch_activities(token)
                 ftp = user["ftp"] or 200
-                values = metrics.compute_metrics(activities, ftp)
+
+                # Load Garmin-seeded CTL baseline (if available) so CTL is grounded
+                # in the full historical training record rather than just Strava history.
+                ctl_seed = db.get_ctl_seed(self.db_path, user["id"])
+
+                values = metrics.compute_metrics(activities, ftp, ctl_seed=ctl_seed)
                 db.save_metrics_cache(self.db_path, user["id"], values)
+
+                # Persist individual activities to activity_log for mcp-coach context
+                db.log_activities(self.db_path, user["id"], activities, ftp)
 
                 # Coaching
                 state = coach_mod.TrainingState.from_metrics(values)
@@ -62,11 +70,12 @@ class Poller(threading.Thread):
                 db.save_coaching_cache(self.db_path, user["id"], result_dict)
 
                 log.info(
-                    "Polled user %s: CTL=%.1f ATL=%.1f TSB=%.1f",
+                    "Polled user %s: CTL=%.1f ATL=%.1f TSB=%.1f (seed=%s)",
                     user["name"],
                     values.get("cycling_ctl", 0),
                     values.get("cycling_atl", 0),
                     values.get("cycling_tsb", 0),
+                    "garmin" if ctl_seed else "none",
                 )
 
                 # Rate-limit spacing between users

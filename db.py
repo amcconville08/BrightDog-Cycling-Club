@@ -807,3 +807,27 @@ def get_recent_activities(db_path: str, user_id: int, days: int = 14) -> list:
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def get_ctl_seed(db_path: str, user_id: int) -> dict:
+    """
+    Return the Garmin-seeded CTL/ATL baseline for a user, or empty dict if none.
+    Used by compute_metrics() to start EWMA from verified historical training load.
+    """
+    conn = get_conn(db_path)
+    try:
+        row = conn.execute(
+            'SELECT ctl, atl, prev_ctl, seed_date FROM ctl_seed WHERE user_id = ?',
+            (user_id,)
+        ).fetchone()
+    except Exception:
+        row = None
+    conn.close()
+    if not row:
+        return {}
+    return {
+        'ctl':       float(row['ctl']),
+        'atl':       float(row['atl']),
+        'prev_ctl':  float(row['prev_ctl']),
+        'seed_date': str(row['seed_date']),
+    }

@@ -35,10 +35,25 @@ def get_today_coaching_brief(db_path: str, user_id: int) -> dict:
 
 def get_readiness_summary(db_path: str, user_id: int) -> dict:
     brief = get_today_coaching_brief(db_path, user_id)
+
+    # Pull prev_ctl from metrics_cache (where it lives as a column)
+    prev_ctl = 0.0
+    try:
+        c = _conn(db_path)
+        row = c.execute(
+            "SELECT prev_ctl FROM metrics_cache WHERE user_id=?", (user_id,)
+        ).fetchone()
+        c.close()
+        if row and row["prev_ctl"]:
+            prev_ctl = float(row["prev_ctl"])
+    except Exception:
+        pass
+
     return {
         "ctl":            round(float(brief.get("ctl", 0)), 1),
         "atl":            round(float(brief.get("atl", 0)), 1),
         "tsb":            round(float(brief.get("tsb", 0)), 1),
+        "prev_ctl":       round(prev_ctl, 1),
         "classification": brief.get("classification", "—"),
         "readiness":      brief.get("readiness_score", 0),
         "ride_style":     brief.get("ride_style", ""),
