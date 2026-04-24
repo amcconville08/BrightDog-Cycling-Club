@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS power_bests (
     best_5min   INTEGER,
     best_10min  INTEGER,
     best_20min  INTEGER,
+    best_30min  INTEGER,
     best_60min  INTEGER,
     computed_at TEXT NOT NULL
 );
@@ -77,13 +78,21 @@ CREATE TABLE IF NOT EXISTS activity_performance (
     has_hr_stream         INTEGER NOT NULL DEFAULT 0,
     has_gps_stream        INTEGER NOT NULL DEFAULT 0,
 
-    -- Athlete-specific power validation
+    -- Athlete-specific power validation — date cutoff
     -- power_trusted = 0 when activity predates the accurate power meter install (2018-06-25).
     -- Raw stream data is preserved; this flag controls inclusion in modelling reports.
-    power_trusted         INTEGER NOT NULL DEFAULT 1,
-    power_exclusion_reason TEXT,
+    power_trusted              INTEGER NOT NULL DEFAULT 1,
+    power_exclusion_reason     TEXT,
 
-    computed_at           TEXT NOT NULL
+    -- Athlete-specific power validation — physiological plausibility
+    -- is_suspicious_power = 1 when a trusted activity still fails ceiling/HR checks
+    -- (trainer scaling errors, virtual power artefacts, calibration issues).
+    -- include_in_ftp_model = 0 for any activity that is either untrusted or suspicious.
+    is_suspicious_power        INTEGER NOT NULL DEFAULT 0,
+    suspicious_reason          TEXT,
+    include_in_ftp_model       INTEGER NOT NULL DEFAULT 1,
+
+    computed_at                TEXT NOT NULL
 );
 
 

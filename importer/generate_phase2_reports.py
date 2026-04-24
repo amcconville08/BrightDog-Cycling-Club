@@ -5,17 +5,24 @@ Usage:
     python importer/generate_phase2_reports.py
 
 Output (data/reports/):
-    power_curve_by_year.csv             Best MMP per duration per year (trusted power only)
-    best_efforts_by_year.csv            Top-3 efforts per duration per year (trusted power only)
-    aerobic_efficiency_by_year.csv      Efficiency Factor trend by year
+    power_curve_by_year.csv             Best MMP per duration per year (model-valid only)
+    best_efforts_by_year.csv            Top-3 efforts per duration per year (model-valid only)
+    aerobic_efficiency_by_year.csv      Efficiency Factor trend by year (all HR activities)
     power_data_quality.csv              Quality score per power activity
-    candidate_ftp_history_filtered.csv  FTP estimates in date order (trusted power only)
+    candidate_ftp_history_filtered.csv  FTP estimates in date order (model-valid only)
+    suspicious_power_efforts.csv        Flagged efforts excluded from modelling + reasons
+    top_valid_threshold_efforts.csv     Best model-valid threshold rides ranked by FTP
 
-Athlete-specific validation rule:
-    Power data before 2018-06-25 is excluded from power modelling reports.
-    Reason: multiple inaccurate/trial power meters were in use before this date.
-    Accurate power meter installed: 25 June 2018.
-    HR data, ride metadata, and aerobic efficiency metrics remain included for all dates.
+Athlete-specific validation:
+    Gate 1 — date cutoff (power_trusted):
+        Power data before 2018-06-25 excluded. Multiple inaccurate/trial
+        power meters in use before accurate meter installed 25 June 2018.
+    Gate 2 — physiological plausibility (is_suspicious_power):
+        Post-cutoff activities are further checked against athlete-specific
+        ceilings and HR cross-checks to catch trainer scaling artefacts.
+    Combined gate — include_in_ftp_model = 1:
+        Only activities passing BOTH gates enter power modelling reports.
+    HR data, ride metadata, and aerobic efficiency are included for all dates.
 """
 import csv
 import os
@@ -30,7 +37,7 @@ DB_PATH      = PROJECT_ROOT / "data" / "processed" / "sqlite" / "garmin_history.
 REPORTS_DIR  = PROJECT_ROOT / "data" / "reports"
 
 _MMP_COLS = ["best_5s", "best_30s", "best_1min",
-             "best_5min", "best_10min", "best_20min", "best_60min"]
+             "best_5min", "best_10min", "best_20min", "best_30min", "best_60min"]
 
 _POWER_TRUST_CUTOFF = "2018-06-25"   # matches import_timeseries.py constant
 
@@ -65,8 +72,7 @@ def _year(iso: str | None) -> str | None:
 def power_curve_by_year(conn: sqlite3.Connection) -> None:
     """
     Best MMP for each standard duration, grouped by year.
-    Only activities where power_quality_score >= 50 AND power_trusted = 1 are counted.
-    Activities before 2018-06-25 are excluded (inaccurate power meter period).
+    Filtered to include_in_ftp_model = 1 (trusted + not suspicious).
     """
     col_list = ", ".join(f"MAX(pb.{c}) AS {c}" for c in _MMP_COLS)
     rows = conn.execute(f"""
@@ -78,8 +84,7 @@ def power_curve_by_year(conn: sqlite3.Connection) -> None:
         JOIN activity_metadata am ON am.id = pb.activity_id
         JOIN activity_performance ap ON ap.activity_id = pb.activity_id
         WHERE am.start_time IS NOT NULL
-          AND ap.power_quality_score >= 50
-          AND ap.power_trusted = 1
+          AND ap.include_in_ftp_model = 1
         GROUP BY year
         ORDER BY year
     """).fetchall()
@@ -94,13 +99,11 @@ def power_curve_by_year(conn: sqlite3.Connection) -> None:
 def best_efforts_by_year(conn: sqlite3.Connection) -> None:
     """
     Top-3 activities for each standard duration, per year.
-    Only activities with power_trusted = 1 are included.
-    Activities before 2018-06-25 are excluded (inaccurate power meter period).
+    Filtered to include_in_ftp_model = 1 only.
     """
     out = []
     for col in _MMP_COLS:
         dur_label = col.replace("best_", "")
-        # Get all activities with this duration's best, ranked within year
         rows = conn.execute(f"""
             SELECT
                 SUBSTR(am.start_time, 1, 4) AS year,
@@ -115,12 +118,10 @@ def best_efforts_by_year(conn: sqlite3.Connection) -> None:
             JOIN fit_files ff           ON ff.file_hash = am.file_hash
             WHERE pb.{col} IS NOT NULL
               AND am.start_time IS NOT NULL
-              AND ap.power_quality_score >= 50
-              AND ap.power_trusted = 1
+              AND ap.include_in_ftp_model = 1
             ORDER BY year, pb.{col} DESC
         """).fetchall()
 
-        # Take top 3 per year
         seen: dict = {}
         for r in rows:
             yr = r["year"]
@@ -128,12 +129,12 @@ def best_efforts_by_year(conn: sqlite3.Connection) -> None:
                 seen[yr] = 0
             if seen[yr] < 3:
                 out.append({
-                    "duration":    dur_label,
-                    "year":        yr,
-                    "rank":        seen[yr] + 1,
-                    "date":        (r["start_time"] or "")[:10],
-                    "watts":       r["watts"],
-                    "quality_pct": r["quality"],
+                    "duration":     dur_label,
+                    "year":         yr,
+                    "rank":         seen[yr] + 1,
+                    "date":         (r["start_time"] or "")[:10],
+                    "watts":        r["watts"],
+                    "quality_pct":  r["quality"],
                     "activity_min": int((r["duration_s"] or 0) / 60),
                 })
                 seen[yr] += 1
@@ -148,7 +149,8 @@ def best_efforts_by_year(conn: sqlite3.Connection) -> None:
 def aerobic_efficiency_by_year(conn: sqlite3.Connection) -> None:
     """
     Efficiency Factor (EF = avg_power / avg_hr) trend by year.
-    Improving EF over time = improving aerobic fitness.
+    All rides ≥ 30 min with HR data — not filtered by power trust,
+    since aerobic trends remain meaningful even with inaccurate power.
     """
     rows = conn.execute("""
         SELECT
@@ -178,8 +180,8 @@ def aerobic_efficiency_by_year(conn: sqlite3.Connection) -> None:
 
 def power_data_quality(conn: sqlite3.Connection) -> None:
     """
-    Per-activity power data quality report.
-    Helps identify rides suitable for FTP estimation vs noisy/partial data.
+    Per-activity power data quality report — all power activities regardless
+    of trust/suspicious status. Includes flags so exclusions are visible.
     """
     rows = conn.execute("""
         SELECT
@@ -195,6 +197,9 @@ def power_data_quality(conn: sqlite3.Connection) -> None:
             ap.power_vi,
             ap.ftp_candidate_w,
             ap.ftp_basis,
+            ap.power_trusted,
+            ap.is_suspicious_power,
+            ap.include_in_ftp_model,
             ff.source_path
         FROM activity_performance ap
         JOIN activity_metadata am ON am.id = ap.activity_id
@@ -212,23 +217,22 @@ def power_data_quality(conn: sqlite3.Connection) -> None:
     fields = ["date", "sport", "sub_sport", "duration_min",
               "total_records", "records_with_power", "power_quality_score",
               "power_avg", "power_np", "power_vi",
-              "ftp_candidate_w", "ftp_basis", "source_path"]
+              "ftp_candidate_w", "ftp_basis",
+              "power_trusted", "is_suspicious_power", "include_in_ftp_model",
+              "source_path"]
     _write_csv("power_data_quality.csv", out, fields)
 
 
-# ── Report 5: candidate_ftp_history ──────────────────────────────────────
+# ── Report 5: candidate_ftp_history_filtered ──────────────────────────────
 
 def candidate_ftp_history(conn: sqlite3.Connection) -> None:
     """
-    Chronological FTP estimates from activities with trusted power data.
-    Activities before 2018-06-25 are excluded (inaccurate power meter period).
+    Chronological FTP estimates from model-valid activities only.
+    include_in_ftp_model = 1 enforces both the date cutoff and plausibility gates.
 
     Methodology:
       - If best_60min exists → FTP candidate = best_60min W
       - If best_20min exists → FTP candidate = best_20min × 0.95
-    Only activities with quality_score >= 60 AND power_trusted = 1 are included.
-
-    Output: candidate_ftp_history_filtered.csv
     """
     rows = conn.execute("""
         SELECT
@@ -240,13 +244,13 @@ def candidate_ftp_history(conn: sqlite3.Connection) -> None:
             ap.power_quality_score,
             ap.power_np,
             pb.best_20min,
+            pb.best_30min,
             pb.best_60min
         FROM activity_performance ap
         JOIN activity_metadata am  ON am.id = ap.activity_id
         JOIN power_bests pb         ON pb.activity_id = ap.activity_id
         WHERE ap.ftp_candidate_w IS NOT NULL
-          AND ap.power_quality_score >= 60
-          AND ap.power_trusted = 1
+          AND ap.include_in_ftp_model = 1
           AND am.start_time IS NOT NULL
           AND am.duration_s >= 1200        -- at least 20 min required
         ORDER BY am.start_time
@@ -261,14 +265,146 @@ def candidate_ftp_history(conn: sqlite3.Connection) -> None:
             "ftp_candidate_w":     r["ftp_candidate_w"],
             "ftp_basis":           r["ftp_basis"],
             "best_20min_w":        r["best_20min"],
+            "best_30min_w":        r["best_30min"],
             "best_60min_w":        r["best_60min"],
             "normalised_power_w":  r["power_np"],
             "quality_score":       r["power_quality_score"],
         })
 
     fields = ["date", "sport", "duration_min", "ftp_candidate_w", "ftp_basis",
-              "best_20min_w", "best_60min_w", "normalised_power_w", "quality_score"]
+              "best_20min_w", "best_30min_w", "best_60min_w",
+              "normalised_power_w", "quality_score"]
     _write_csv("candidate_ftp_history_filtered.csv", out, fields)
+
+
+# ── Report 6: suspicious_power_efforts ───────────────────────────────────
+
+def suspicious_power_efforts(conn: sqlite3.Connection) -> None:
+    """
+    All trusted-period activities flagged as physiologically suspicious.
+    These are excluded from FTP modelling. Report preserved for review.
+    """
+    rows = conn.execute("""
+        SELECT
+            am.start_time,
+            am.sport,
+            am.sub_sport,
+            ROUND(am.duration_s / 60.0, 1)   AS duration_min,
+            ap.ftp_candidate_w,
+            ap.ftp_basis,
+            ap.power_quality_score,
+            ap.hr_avg,
+            ap.hr_max,
+            ap.power_avg,
+            ap.power_np,
+            pb.best_20min,
+            pb.best_30min,
+            pb.best_60min,
+            ap.suspicious_reason,
+            ff.source_path
+        FROM activity_performance ap
+        JOIN activity_metadata am ON am.id = ap.activity_id
+        JOIN power_bests pb        ON pb.activity_id = ap.activity_id
+        JOIN fit_files ff          ON ff.file_hash = am.file_hash
+        WHERE ap.power_trusted = 1
+          AND ap.is_suspicious_power = 1
+          AND am.start_time IS NOT NULL
+        ORDER BY ap.ftp_candidate_w DESC NULLS LAST
+    """).fetchall()
+
+    out = []
+    for r in rows:
+        out.append({
+            "date":              (r["start_time"] or "")[:10],
+            "sport":             r["sport"],
+            "sub_sport":         r["sub_sport"],
+            "duration_min":      r["duration_min"],
+            "ftp_candidate_w":   r["ftp_candidate_w"],
+            "ftp_basis":         r["ftp_basis"],
+            "best_20min_w":      r["best_20min"],
+            "best_30min_w":      r["best_30min"],
+            "best_60min_w":      r["best_60min"],
+            "hr_avg":            r["hr_avg"],
+            "hr_max":            r["hr_max"],
+            "power_avg":         r["power_avg"],
+            "power_np":          r["power_np"],
+            "quality_score":     r["power_quality_score"],
+            "suspicious_reason": r["suspicious_reason"],
+            "source_path":       os.path.relpath(r["source_path"], PROJECT_ROOT),
+        })
+
+    fields = ["date", "sport", "sub_sport", "duration_min",
+              "ftp_candidate_w", "ftp_basis",
+              "best_20min_w", "best_30min_w", "best_60min_w",
+              "hr_avg", "hr_max", "power_avg", "power_np",
+              "quality_score", "suspicious_reason", "source_path"]
+    _write_csv("suspicious_power_efforts.csv", out, fields)
+
+
+# ── Report 7: top_valid_threshold_efforts ─────────────────────────────────
+
+def top_valid_threshold_efforts(conn: sqlite3.Connection) -> None:
+    """
+    Best model-valid threshold efforts, ranked by FTP estimate descending.
+    These are the most reliable inputs for FTP modelling and progression tracking.
+    """
+    rows = conn.execute("""
+        SELECT
+            am.start_time,
+            am.sport,
+            am.sub_sport,
+            ROUND(am.duration_s / 60.0, 1)   AS duration_min,
+            am.total_ascent_m,
+            ap.ftp_candidate_w,
+            ap.ftp_basis,
+            ap.power_quality_score,
+            ap.hr_avg,
+            ap.hr_max,
+            ap.power_avg,
+            ap.power_np,
+            pb.best_20min,
+            pb.best_30min,
+            pb.best_60min,
+            ff.source_path
+        FROM activity_performance ap
+        JOIN activity_metadata am ON am.id = ap.activity_id
+        JOIN power_bests pb        ON pb.activity_id = ap.activity_id
+        JOIN fit_files ff          ON ff.file_hash = am.file_hash
+        WHERE ap.include_in_ftp_model = 1
+          AND ap.ftp_candidate_w IS NOT NULL
+          AND am.start_time IS NOT NULL
+          AND am.duration_s >= 1200
+        ORDER BY ap.ftp_candidate_w DESC
+        LIMIT 50
+    """).fetchall()
+
+    out = []
+    for r in rows:
+        out.append({
+            "date":            (r["start_time"] or "")[:10],
+            "sport":           r["sport"],
+            "sub_sport":       r["sub_sport"],
+            "duration_min":    r["duration_min"],
+            "ftp_candidate_w": r["ftp_candidate_w"],
+            "ftp_basis":       r["ftp_basis"],
+            "best_20min_w":    r["best_20min"],
+            "best_30min_w":    r["best_30min"],
+            "best_60min_w":    r["best_60min"],
+            "hr_avg":          r["hr_avg"],
+            "hr_max":          r["hr_max"],
+            "power_avg":       r["power_avg"],
+            "normalised_power_w": r["power_np"],
+            "total_ascent_m":  r["total_ascent_m"],
+            "quality_score":   r["power_quality_score"],
+            "source_path":     os.path.relpath(r["source_path"], PROJECT_ROOT),
+        })
+
+    fields = ["date", "sport", "sub_sport", "duration_min",
+              "ftp_candidate_w", "ftp_basis",
+              "best_20min_w", "best_30min_w", "best_60min_w",
+              "hr_avg", "hr_max", "power_avg", "normalised_power_w",
+              "total_ascent_m", "quality_score", "source_path"]
+    _write_csv("top_valid_threshold_efforts.csv", out, fields)
 
 
 # ── Summary to console ────────────────────────────────────────────────────
@@ -277,63 +413,93 @@ def print_summary(conn: sqlite3.Connection) -> None:
     print()
     print("=== Phase 2 summary ===")
 
-    # Activities imported
     r = conn.execute("""
         SELECT
-            COUNT(*)                                     AS total,
-            SUM(CASE WHEN status='done'   THEN 1 ELSE 0 END) AS done,
-            SUM(CASE WHEN status='error'  THEN 1 ELSE 0 END) AS errors,
-            SUM(CASE WHEN status='skipped'THEN 1 ELSE 0 END) AS skipped
+            COUNT(*)                                          AS total,
+            SUM(CASE WHEN status='done'    THEN 1 ELSE 0 END) AS done,
+            SUM(CASE WHEN status='error'   THEN 1 ELSE 0 END) AS errors,
+            SUM(CASE WHEN status='skipped' THEN 1 ELSE 0 END) AS skipped
         FROM timeseries_imports
     """).fetchone()
     if r and r["total"]:
-        print(f"  Timeseries imports : {r['done']} done / {r['errors']} errors / {r['skipped']} skipped")
+        print(f"  Timeseries imports : {r['done']} done / "
+              f"{r['errors']} errors / {r['skipped']} skipped")
 
     stream_rows = conn.execute("SELECT COUNT(*) FROM activity_streams").fetchone()[0]
     print(f"  Stream records     : {stream_rows:,}")
 
-    # ── Power validation summary ───────────────────────────────────────────
+    # ── Power validation breakdown ─────────────────────────────────────────
     print()
     print("=== Power data validation ===")
-    trust_counts = conn.execute("""
+
+    counts = conn.execute("""
         SELECT
             power_trusted,
+            is_suspicious_power,
+            include_in_ftp_model,
             COUNT(*) AS cnt
         FROM activity_performance
         WHERE has_power_stream = 1
-        GROUP BY power_trusted
+        GROUP BY power_trusted, is_suspicious_power, include_in_ftp_model
     """).fetchall()
-    trusted_n   = next((r["cnt"] for r in trust_counts if r["power_trusted"] == 1), 0)
-    untrusted_n = next((r["cnt"] for r in trust_counts if r["power_trusted"] == 0), 0)
-    print(f"  Trusted power activities   : {trusted_n}  (from {_POWER_TRUST_CUTOFF} onward)")
-    print(f"  Untrusted power activities : {untrusted_n}  (before {_POWER_TRUST_CUTOFF})")
-    print(f"  NOTE: Power data before {_POWER_TRUST_CUTOFF} excluded due to known")
-    print(f"        inaccurate power meter period. HR and ride data remain valid.")
 
-    # FTP history (trusted only)
-    ftp_rows = conn.execute("""
-        SELECT COUNT(*) FROM activity_performance
-        WHERE ftp_candidate_w IS NOT NULL
-          AND power_quality_score >= 60
-          AND power_trusted = 1
-    """).fetchone()[0]
-    print(f"  Trusted FTP candidates     : {ftp_rows}")
+    untrusted_n  = sum(r["cnt"] for r in counts if r["power_trusted"] == 0)
+    suspicious_n = sum(r["cnt"] for r in counts
+                       if r["power_trusted"] == 1 and r["is_suspicious_power"] == 1)
+    valid_n      = sum(r["cnt"] for r in counts if r["include_in_ftp_model"] == 1)
+    total_pwr    = sum(r["cnt"] for r in counts)
 
-    # Best ever from trusted activities only
-    best = conn.execute("""
-        SELECT am.start_time, pb.best_20min, pb.best_60min
-        FROM power_bests pb
-        JOIN activity_metadata am         ON am.id = pb.activity_id
-        JOIN activity_performance ap      ON ap.activity_id = pb.activity_id
+    print(f"  Total power activities     : {total_pwr}")
+    print(f"  ├─ Gate 1 excluded (pre-{_POWER_TRUST_CUTOFF})  : {untrusted_n}")
+    print(f"  ├─ Gate 2 excluded (suspicious) : {suspicious_n}")
+    print(f"  └─ Model-valid (both gates pass): {valid_n}")
+
+    # ── Top valid threshold efforts ────────────────────────────────────────
+    print()
+    print("  Top valid threshold efforts:")
+    top_valid = conn.execute("""
+        SELECT am.start_time, ap.ftp_candidate_w, ap.ftp_basis,
+               pb.best_20min, pb.best_60min, ap.hr_avg
+        FROM activity_performance ap
+        JOIN activity_metadata am ON am.id = ap.activity_id
+        JOIN power_bests pb        ON pb.activity_id = ap.activity_id
+        WHERE ap.include_in_ftp_model = 1
+          AND ap.ftp_candidate_w IS NOT NULL
+        ORDER BY ap.ftp_candidate_w DESC
+        LIMIT 5
+    """).fetchall()
+    for i, r in enumerate(top_valid, 1):
+        date   = (r["start_time"] or "")[:10]
+        b20    = f"20min={r['best_20min']}W" if r["best_20min"] else ""
+        b60    = f"60min={r['best_60min']}W" if r["best_60min"] else ""
+        hr_str = f"HR={r['hr_avg']}bpm"      if r["hr_avg"]     else ""
+        print(f"    {i}. {date}  FTP~{r['ftp_candidate_w']}W ({r['ftp_basis']})"
+              f"  {b20}  {b60}  {hr_str}")
+
+    # ── Top suspicious efforts (for awareness) ─────────────────────────────
+    print()
+    print("  Top suspicious efforts excluded:")
+    top_sus = conn.execute("""
+        SELECT am.start_time, ap.ftp_candidate_w, ap.suspicious_reason,
+               pb.best_20min, pb.best_60min, ap.hr_avg
+        FROM activity_performance ap
+        JOIN activity_metadata am ON am.id = ap.activity_id
+        JOIN power_bests pb        ON pb.activity_id = ap.activity_id
         WHERE ap.power_trusted = 1
-        ORDER BY COALESCE(pb.best_60min, pb.best_20min * 0.95) DESC NULLS LAST
-        LIMIT 1
-    """).fetchone()
-    if best:
-        b60  = f"60-min best: {best['best_60min']}W"  if best["best_60min"] else ""
-        b20  = f"20-min best: {best['best_20min']}W"  if best["best_20min"] else ""
-        date = (best["start_time"] or "")[:10]
-        print(f"  Highest trusted effort     : {date}  {b60 or b20}")
+          AND ap.is_suspicious_power = 1
+          AND ap.ftp_candidate_w IS NOT NULL
+        ORDER BY ap.ftp_candidate_w DESC
+        LIMIT 5
+    """).fetchall()
+    for i, r in enumerate(top_sus, 1):
+        date    = (r["start_time"] or "")[:10]
+        reason  = (r["suspicious_reason"] or "")[:80]
+        b20     = f"20min={r['best_20min']}W" if r["best_20min"] else ""
+        b60     = f"60min={r['best_60min']}W" if r["best_60min"] else ""
+        hr_str  = f"HR={r['hr_avg']}bpm"      if r["hr_avg"]     else ""
+        print(f"    {i}. {date}  FTP~{r['ftp_candidate_w']}W  "
+              f"{b20}  {b60}  {hr_str}")
+        print(f"       ↳ {reason}")
 
     print()
 
@@ -344,17 +510,22 @@ def run() -> None:
     print(f"Database : {DB_PATH}")
     print(f"Reports  : {REPORTS_DIR}")
     print()
+    print("Athlete power validation rules:")
+    print(f"  Gate 1 — date cutoff      : power_trusted (before {_POWER_TRUST_CUTOFF} excluded)")
+    print(f"  Gate 2 — plausibility     : is_suspicious_power (ceiling/HR checks)")
+    print(f"  Combined gate             : include_in_ftp_model = 1")
+    print()
 
     conn = _open_db()
 
     print("Generating Phase 2 reports…")
-    print(f"  Power trust cutoff : {_POWER_TRUST_CUTOFF} (inaccurate meter before this date)")
-    print()
     power_curve_by_year(conn)
     best_efforts_by_year(conn)
     aerobic_efficiency_by_year(conn)
     power_data_quality(conn)
     candidate_ftp_history(conn)
+    suspicious_power_efforts(conn)
+    top_valid_threshold_efforts(conn)
 
     print_summary(conn)
     conn.close()

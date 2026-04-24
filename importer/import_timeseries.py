@@ -45,10 +45,11 @@ _MMP_DURATIONS = {                      # durations for mean-maximal power
     "best_5min":  300,
     "best_10min": 600,
     "best_20min": 1200,
+    "best_30min": 1800,
     "best_60min": 3600,
 }
 
-# ── Athlete-specific power validation ─────────────────────────────────────
+# ── Athlete-specific power validation — date cutoff ───────────────────────
 # Before this date, multiple inaccurate/trial power meters were in use.
 # Power data from these activities must not be used for FTP modelling,
 # power curve analysis, or best-effort detection.
@@ -58,6 +59,26 @@ _POWER_EXCLUSION_MSG = (
     "Pre-2018-06-25: inaccurate power meter period — "
     "data excluded from power modelling"
 )
+
+# ── Athlete-specific power ceiling rules (post-cutoff) ────────────────────
+# Calibrated to known athlete history: true 20-min peak ~297 W,
+# realistic FTP range 270–290 W. Values below are generous upper bounds
+# beyond which data is almost certainly a trainer/calibration artifact.
+#
+# Rule A — 20-min best above physiological ceiling
+_CEILING_20MIN_W    = 330
+# Rule B — FTP estimate above ceiling
+_CEILING_FTP_W      = 310
+# Rule C — high 20-min power paired with suspiciously low HR
+_SUSPICIOUS_20MIN_W = 320
+# Rule D — high 60-min power paired with suspiciously low HR
+_SUSPICIOUS_60MIN_W = 290
+# Rules C/D — HR below this threshold at high power → likely trainer artefact
+_SUSPICIOUS_LOW_HR  = 155
+# Rule E — minimum power-data quality to enter the FTP model
+_MIN_QUALITY_MODEL  = 50
+# Rule F — sub_sport values that indicate indoor / virtual power sources
+_INDOOR_SUB_SPORTS  = {"indoor_cycling", "virtual_activity", "spin"}
 
 # Activities to target: sport matches or indoor cycling sub-sport
 _CYCLING_WHERE = """
@@ -325,6 +346,92 @@ def _compute_power_bests(records: list) -> dict:
     }
 
 
+def _check_suspicious_power(
+    bests: dict,
+    ftp_candidate_w: Optional[int],
+    hr_avg: Optional[int],
+    quality: int,
+    sub_sport: str,
+    power_trusted: int,
+) -> tuple:
+    """
+    Evaluate post-cutoff trusted power data for physiological plausibility.
+
+    Returns (is_suspicious: int, reason: str|None, include_in_ftp_model: int).
+
+    Rules (any one is sufficient to flag suspicious):
+      A  20-min best > _CEILING_20MIN_W
+      B  FTP estimate > _CEILING_FTP_W
+      C  20-min best > _SUSPICIOUS_20MIN_W  AND  avg HR < _SUSPICIOUS_LOW_HR
+      D  60-min best > _SUSPICIOUS_60MIN_W  AND  avg HR < _SUSPICIOUS_LOW_HR
+      E  power_quality_score < _MIN_QUALITY_MODEL
+      F  indoor/virtual sub_sport  AND  at least one other rule fires
+
+    Untrusted activities (power_trusted = 0) are already excluded;
+    this function returns a neutral result for them.
+    """
+    if not power_trusted:
+        # Already excluded by the date cutoff — don't double-flag
+        return 0, None, 0
+
+    # No power data at all — not suspicious, just no meter fitted.
+    # FTP reports already filter on ftp_candidate_w IS NOT NULL so these
+    # activities are naturally excluded from power modelling without needing
+    # a suspicious flag.
+    if quality == 0 and not ftp_candidate_w:
+        return 0, None, 1
+
+    reasons = []
+
+    best_20 = bests.get("best_20min") or 0
+    best_60 = bests.get("best_60min") or 0
+    ftp_est = ftp_candidate_w or 0
+    hr      = hr_avg or 999   # treat missing HR as high (won't trigger low-HR rules)
+
+    # Rule A
+    if best_20 > _CEILING_20MIN_W:
+        reasons.append(
+            f"20-min best {best_20}W exceeds athlete ceiling ({_CEILING_20MIN_W}W)"
+        )
+
+    # Rule B
+    if ftp_est > _CEILING_FTP_W:
+        reasons.append(
+            f"FTP estimate {ftp_est}W exceeds athlete ceiling ({_CEILING_FTP_W}W)"
+        )
+
+    # Rule C
+    if best_20 > _SUSPICIOUS_20MIN_W and hr < _SUSPICIOUS_LOW_HR:
+        reasons.append(
+            f"20-min best {best_20}W with avg HR {hr}bpm "
+            f"(high power + low HR — probable trainer scaling artefact)"
+        )
+
+    # Rule D
+    if best_60 > _SUSPICIOUS_60MIN_W and hr < _SUSPICIOUS_LOW_HR:
+        reasons.append(
+            f"60-min best {best_60}W with avg HR {hr}bpm "
+            f"(high 60-min power + low HR — probable trainer scaling artefact)"
+        )
+
+    # Rule E — only applies when there IS power data but coverage is patchy.
+    # quality == 0 means no power meter at all; that's handled above.
+    if 0 < quality < _MIN_QUALITY_MODEL:
+        reasons.append(
+            f"Power quality score {quality}/100 below minimum ({_MIN_QUALITY_MODEL})"
+        )
+
+    # Rule F — indoor/virtual flag (only as co-reason, not standalone)
+    if sub_sport.lower() in _INDOOR_SUB_SPORTS and reasons:
+        reasons.append(f"Indoor/virtual activity (sub_sport={sub_sport!r})")
+
+    is_suspicious = 1 if reasons else 0
+    reason_str    = "; ".join(reasons) if reasons else None
+    include       = 0 if is_suspicious else 1
+
+    return is_suspicious, reason_str, include
+
+
 def _compute_performance(records: list, activity: dict, bests: dict) -> dict:
     """
     Derive session-level metrics from the full record stream.
@@ -376,7 +483,7 @@ def _compute_performance(records: list, activity: dict, bests: dict) -> dict:
     # Score = % of records with non-zero power
     quality = int(round(len(pwr_vals) / total * 100)) if total else 0
 
-    # ── Power trust flag (athlete-specific validation rule) ───────────────
+    # ── Power trust flag (date cutoff) ───────────────────────────────────
     # Activities before 2018-06-25 used inaccurate/trial power meters.
     # Mark as untrusted so reports can exclude them from modelling.
     # HR data, metadata, and distance/duration remain valid.
@@ -387,6 +494,19 @@ def _compute_performance(records: list, activity: dict, bests: dict) -> dict:
     else:
         power_trusted = 1
         power_exclusion_reason = None
+
+    # ── Suspicious power detection (post-cutoff activities only) ─────────
+    # Even within the trusted period, trainer calibration errors and virtual
+    # power artefacts can produce physiologically implausible readings.
+    # Flagging here keeps raw values intact while excluding from FTP model.
+    is_suspicious, suspicious_reason, include_in_ftp = _check_suspicious_power(
+        bests=bests,
+        ftp_candidate_w=ftp_w,
+        hr_avg=hr_avg,
+        quality=quality,
+        sub_sport=(activity.get("sub_sport") or ""),
+        power_trusted=power_trusted,
+    )
 
     return {
         "hr_avg":                 hr_avg,
@@ -408,6 +528,9 @@ def _compute_performance(records: list, activity: dict, bests: dict) -> dict:
         "has_gps_stream":         1 if lat_vals else 0,
         "power_trusted":          power_trusted,
         "power_exclusion_reason": power_exclusion_reason,
+        "is_suspicious_power":    is_suspicious,
+        "suspicious_reason":      suspicious_reason,
+        "include_in_ftp_model":   include_in_ftp,
     }
 
 
@@ -439,14 +562,15 @@ def _upsert_power_bests(conn: sqlite3.Connection,
     conn.execute(
         """INSERT OR REPLACE INTO power_bests
            (activity_id, best_5s, best_30s, best_1min,
-            best_5min, best_10min, best_20min, best_60min, computed_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            best_5min, best_10min, best_20min, best_30min, best_60min, computed_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             activity_id,
-            bests.get("best_5s"),   bests.get("best_30s"),
-            bests.get("best_1min"), bests.get("best_5min"),
+            bests.get("best_5s"),    bests.get("best_30s"),
+            bests.get("best_1min"),  bests.get("best_5min"),
             bests.get("best_10min"), bests.get("best_20min"),
-            bests.get("best_60min"), _now(),
+            bests.get("best_30min"), bests.get("best_60min"),
+            _now(),
         ),
     )
 
@@ -462,8 +586,9 @@ def _upsert_performance(conn: sqlite3.Connection,
             power_quality_score,
             has_power_stream, has_hr_stream, has_gps_stream,
             power_trusted, power_exclusion_reason,
+            is_suspicious_power, suspicious_reason, include_in_ftp_model,
             computed_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             activity_id,
             perf.get("hr_avg"),         perf.get("hr_max"),
@@ -478,8 +603,11 @@ def _upsert_performance(conn: sqlite3.Connection,
             perf.get("has_power_stream", 0),
             perf.get("has_hr_stream",    0),
             perf.get("has_gps_stream",   0),
-            perf.get("power_trusted", 1),
+            perf.get("power_trusted",         1),
             perf.get("power_exclusion_reason"),
+            perf.get("is_suspicious_power",   0),
+            perf.get("suspicious_reason"),
+            perf.get("include_in_ftp_model",  1),
             _now(),
         ),
     )
