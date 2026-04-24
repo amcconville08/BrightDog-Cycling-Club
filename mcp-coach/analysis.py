@@ -237,19 +237,19 @@ def compute_priority_of_week(
             "Aerobic spin or rest. Let Tuesday do its job."
         )
 
-    # Thursday-Friday: secondary quality window
+    # Thursday-Friday: support session window
     if day_of_week in [3, 4]:
         if tsb > -20 and season in ("spring_build", "summer_threshold"):
             return (
-                "Secondary quality window — if legs are good, one solid tempo or "
-                "aerobic endurance session here supports the chain gang without undermining it."
+                "Good day for a tempo or aerobic ride — chain gang is done, "
+                "weekend is coming. Keep it controlled. Don't turn this into a third hard day."
             )
         if target_pct < 50:
             return (
-                "Weekly TSS is low — a solid aerobic session today builds the week "
-                "without adding peak fatigue before the weekend."
+                "Week is light on load — a solid aerobic ride today builds the week "
+                "without burying the legs before the weekend."
             )
-        return "Mid-week support sessions — aerobic work if the legs cooperate, easy if they don't."
+        return "Mid-week support — aerobic work if the legs cooperate, spin or rest if not."
 
     # Weekend (Saturday-Sunday): long ride territory
     if day_of_week in [5, 6]:
